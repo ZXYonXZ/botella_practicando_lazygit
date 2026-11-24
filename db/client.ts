@@ -7,4 +7,3 @@ import * as schema from "./schema.ts";
  */
 export const db = drizzle(Deno.env.get("PGDATA_DIR") ?? "./data/pgdata", { schema });
 
-export { schema };

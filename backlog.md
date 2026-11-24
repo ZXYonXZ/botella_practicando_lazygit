@@ -9,8 +9,9 @@ Expensive decisions: ninguna.
 
 1. As the product owner, I want the stack decided, so that every later story is built on a known base.
 2a. As a person, I want to write a text bottle and throw it into the sea, so that someone I don't know can find it.
-2b. As a person, I want the sea to show me one free bottle at a time and let me discard it without seeing it again, so that I only pick the ones I want.
+2b. As a person, I want the sea to show me one free bottle I haven't seen before, so that I only get bottles that are new to me.
 2c. As a person, I want a bottle I pick to stay reserved to me for 48 hours, so that nobody else takes it while I decide. Requires: 2a, 2b
+2d. As a person, I want to decide what happens to a bottle I don't want, so that I can destroy it or put it back in the sea. Requires: 2b
 3. As a person, I want to throw at most 5 new bottles a day, so that the sea doesn't flood with throwaway messages.
 4. As a person, I want a minimal profile when I throw or pick a bottle, so that the other person knows who they're talking to.
 5. As a person, I want to chat with the person whose bottle I picked up, so that the first contact can continue.
@@ -27,8 +28,9 @@ Expensive decisions: ninguna.
 ## Notas
 
 - Las botellas no caducan nunca: siguen en el mar hasta que alguien las recoge.
+- Tus propias botellas no te aparecen en el mar.
 - Texto de la botella: entre 5 y 240 caracteres.
 - Una botella recogida queda reservada 48 horas; si no hay respuesta, vuelve al mar.
-- Una botella descartada vuelve al mar y no se le vuelve a mostrar a quien la descartó.
+- Descartar tiene dos resultados: destruir (sale del mar para todos, para siempre) o devolver (sigue disponible para otros, pero no para quien la descartó).
 - El tope es de 5 botellas **nuevas** al día, aunque las anteriores sigan en el mar, así que el número de botellas propias a la deriva puede crecer sin límite (la lista de «mis botellas» debe soportarlo).
-- Pendiente de decidir el stack para cerrar la historia #1.
+- Stack decidido: Deno 2.9 + Hono 4 + Drizzle ORM + PGlite.

@@ -21,13 +21,31 @@ deno task dev           # http://localhost:8000
 
 ## Endpoints
 
-| Método | Ruta      | Descripción                  |
-| ------ | --------- | ---------------------------- |
-| GET    | `/`       | Saludo                       |
-| GET    | `/health` | Estado + versión de Postgres |
+| Método | Ruta                        | Descripción                                         |
+| ------ | --------------------------- | --------------------------------------------------- |
+| GET    | `/`                         | Saludo                                              |
+| GET    | `/health`                   | Estado + versión de Postgres                        |
+| GET    | `/api/profile`              | Mi alias (o `null`)                                 |
+| PUT    | `/api/profile`              | Crear o cambiar mi alias (`{ "alias" }`, 3–20)      |
+| POST   | `/api/bottles`              | Lanzar botella (`{ "text" }`, 5–240) · 5 al día (429) |
+| GET    | `/api/sea`                  | Una botella libre que este visitante no haya visto  |
+| POST   | `/api/bottles/:id/discard`  | Descartar (`{ "action": "destroy" \| "return" }`)   |
+| POST   | `/api/bottles/:id/pick`     | Recoger: reserva la botella 48 h                    |
+| POST   | `/api/bottles/:id/release`  | Liberar mi reserva antes de tiempo                  |
+
+La identidad anónima viaja en la cookie `visitor` (UUID); el servidor la pone en la primera visita.
+
+Reglas: descartar exige haber visto la botella (`403` si no); `destroy` la saca del mar para todos para siempre y `return` no cambia su disponibilidad. El cuerpo de las peticiones está limitado a 8 KB (`413`).
 
 ```bash
 curl http://localhost:8000/health
+curl -X POST http://localhost:8000/api/bottles \
+  -H 'content-type: application/json' \
+  -d '{"text":"Hola desde el mar"}'
+curl -c cookies.txt http://localhost:8000/api/sea
+curl -b cookies.txt -X POST http://localhost:8000/api/bottles/1/discard \
+  -H 'content-type: application/json' \
+  -d '{"action":"return"}'
 ```
 
 ## Tareas
@@ -40,17 +58,21 @@ curl http://localhost:8000/health
 | `deno task db:push`     | Sincroniza el esquema con la BD (desarrollo) |
 | `deno task db:generate` | Genera SQL de migración en `db/migrations/`  |
 | `deno task db:studio`   | Drizzle Studio                               |
+| `deno task test`        | Sincroniza la BD de test y corre la suite    |
+| `deno task db:push:test`| Solo sincroniza el esquema de `data/test-pgdata` |
 
 ## Estructura
 
 ```
 main.ts             # app Hono + rutas
+api_test.ts         # tests HTTP de la API
 drizzle.config.ts   # configuración de drizzle-kit
 db/
   schema.ts         # tablas y relaciones
   client.ts         # conexión PGlite + drizzle
   migrations/       # (se genera con db:generate)
-data/pgdata/        # datos de PGlite (ignorado en git)
+data/pgdata/        # datos de PGlite en desarrollo (ignorado en git)
+data/test-pgdata/   # base separada para los tests (ignorada en git)
 ```
 
 ## Notas
