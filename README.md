@@ -31,8 +31,15 @@ deno task dev           # http://localhost:8000
 | POST   | `/api/auth/logout`          | Cerrar la sesión actual                             |
 | POST   | `/api/auth/logout-all`      | Cerrar todas las sesiones de la cuenta              |
 | GET    | `/api/bottles/mine`         | Mis botellas con estado; `?before=<id>` para paginar |
+| POST   | `/api/profile/photos`       | Subir foto (multipart, campo `photo`, 5 MB, 6 máx.) |
+| DELETE | `/api/profile/photos/:id`   | Borrar una foto mía                                 |
+| GET    | `/api/photos/:id`           | Servir la foto (sin identidad, por id no adivinable)|
+| POST   | `/api/blocks`               | Bloquear a alguien (`{ publicId }`)                 |
+| DELETE | `/api/blocks/:publicId`     | Desbloquear                                         |
+| GET    | `/api/blocks`               | Mis bloqueos (`publicId` y alias)                   |
+| POST   | `/api/reports`              | Reportar (`{ publicId, reason, text?, bottleId? }`) |
 | GET    | `/api/profile`              | Mi alias (o `null`)                                 |
-| PUT    | `/api/profile`              | Crear o cambiar mi alias (`{ "alias" }`, 3–20)      |
+| PUT    | `/api/profile`              | Crear o cambiar alias y bio (`{ "alias", "bio"? }`) |
 | POST   | `/api/bottles`              | Lanzar botella (`{ "text" }`, 5–240) · 5 al día (429) |
 | GET    | `/api/sea`                  | Una botella libre que este visitante no haya visto  |
 | POST   | `/api/bottles/:id/discard`  | Descartar (`{ "action": "destroy" \| "return" }`)   |
@@ -44,11 +51,11 @@ deno task dev           # http://localhost:8000
 La identidad anónima viaja en la cookie `visitor` (UUID). Con cuenta se usa `Authorization: Bearer <token>`;
 si el visitante de la cookie tiene cuenta, la cookie deja de valer (`401`).
 
-Variables de entorno: `PORT` (8000), `PGDATA_DIR` (`./data/pgdata`) y **`TOKEN_PEPPER`** (≥32 bytes, obligatorio
+Variables de entorno: `PORT` (8000), `PGDATA_DIR` (`./data/pgdata`), `UPLOADS_DIR` (`./data/uploads`) y **`TOKEN_PEPPER`** (≥32 bytes, obligatorio
 en producción; sin él se usa uno de desarrollo y se avisa por consola). Las contraseñas se guardan con
 PBKDF2-SHA256 (600 000 iteraciones) y los tokens solo como HMAC-SHA256 con ese pimiento.
 
-Reglas: descartar exige haber visto la botella (`403` si no); una conversación fijada no se puede descartar ni liberar (`409`); mensajes de 1–500 con `?before=<id>` para paginar; `destroy` la saca del mar para todos para siempre y `return` no cambia su disponibilidad. El cuerpo de las peticiones está limitado a 8 KB (`413`).
+Reglas: descartar exige haber visto la botella (`403` si no); una conversación fijada no se puede descartar ni liberar (`409`); mensajes de 1–500 con `?before=<id>` para paginar; `destroy` la saca del mar para todos para siempre y `return` no cambia su disponibilidad. El cuerpo de las peticiones está limitado a 8 KB (`413`), salvo la subida de fotos (6 MB de cuerpo, 5 MB por archivo). Las fotos se validan por sus bytes (JPEG/PNG/WebP) y se sirven con `nosniff`.
 
 ```bash
 curl http://localhost:8000/health

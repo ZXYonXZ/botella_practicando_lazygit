@@ -1,9 +1,11 @@
 import { assertEquals, assertMatch } from "@std/assert";
+import { sql } from "drizzle-orm";
 
 // La BD de test vive en data/test-pgdata, separada de la de desarrollo.
 Deno.env.set("PGDATA_DIR", "./data/test-pgdata");
+Deno.env.set("UPLOADS_DIR", "./data/test-uploads");
 
-const { app } = await import("./main.ts");
+const { app, resetRateLimit, resetReportLimit, resetUploadLimit } = await import("./main.ts");
 const { db } = await import("./db/client.ts");
 
 // Lanzar crea una visita con perfil si no se pasa cookie: el producto exige alias para lanzar.
@@ -188,9 +190,8 @@ Deno.test("Una botella que ya vi no me vuelve a tocar", async () => {
   await lanzar({ text: "Botella uno" });
   await lanzar({ text: "Botella dos" });
 
-  const primera = await pedirDelMar();
-  const cookie = (primera.headers.get("set-cookie") ?? "").split(";")[0];
-  const { data: vista } = await primera.json();
+  const cookie = await crearVisita("Lectora");
+  const { data: vista } = await (await pedirDelMar(cookie)).json();
 
   const segunda = await pedirDelMar(cookie);
   const { data: otra } = await segunda.json();
@@ -236,8 +237,10 @@ Deno.test("Cuando ya vi todas las botellas responde 200 con data null", async ()
   await db.execute("delete from bottles");
   await lanzar({ text: "La única botella" });
 
-  const primera = await pedirDelMar();
-  const cookie = (primera.headers.get("set-cookie") ?? "").split(";")[0];
+  const cookie = await crearVisita("Lectora");
+
+  const primera = await pedirDelMar(cookie);
+  assertEquals((await primera.json()).data.text, "La única botella");
 
   const segunda = await pedirDelMar(cookie);
 
@@ -395,8 +398,7 @@ Deno.test("Destruir dos veces responde 404 la segunda", async () => {
 Deno.test("Dos peticiones simultáneas del mismo visitante no reciben la misma botella", async () => {
   await db.execute("delete from bottles");
 
-  const inicial = await pedirDelMar();
-  const cookie = (inicial.headers.get("set-cookie") ?? "").split(";")[0];
+  const cookie = await crearVisita("Lectora");
 
   await lanzar({ text: "La única botella" });
 
@@ -423,8 +425,7 @@ Deno.test("La cookie del visitante en mayúsculas es el mismo visitante", async 
   await db.execute("delete from bottles");
   await lanzar({ text: "Botella uno" });
 
-  const mia = await pedirDelMar();
-  const [cookie] = (mia.headers.get("set-cookie") ?? "").split(";");
+  const cookie = await crearVisita("Lectora");
   const [nombre, valor] = cookie.split("=");
 
   await pedirDelMar(`${nombre}=${valor.toUpperCase()}`);
@@ -695,7 +696,11 @@ const miPerfil = (cookie?: string) =>
 
 const crearVisita = async (alias = "Tester") => {
   const res = await ponerPerfil(alias);
-  return (res.headers.get("set-cookie") ?? "").split(";")[0];
+  const cookie = (res.headers.get("set-cookie") ?? "").split(";")[0];
+  if (res.status !== 200 || !cookie) {
+    throw new Error(`no se pudo crear la visita "${alias}": ${res.status}`);
+  }
+  return cookie;
 };
 
 Deno.test("PUT /api/profile guarda el alias y reparte cookie", async () => {
@@ -780,4 +785,1269 @@ Deno.test("Mi propia botella no me toca en el mar, pero sí a otra visita", asyn
 
   const ajena = await pedirDelMar();
   assertEquals((await ajena.json()).data.text, "Botella de autora");
+});
+
+// ------------------------------------------- arreglos de la tercera revisión
+Deno.test("Tras expirar la reserva, otra visita puede recoger la botella", async () => {
+  await db.execute("delete from bottles");
+  await lanzar({ text: "Botella que caduca" });
+
+  const cookieA = await crearVisita("Ana");
+  const { data: vista } = await (await pedirDelMar(cookieA)).json();
+  assertEquals((await recoger(vista.id, cookieA)).status, 200);
+
+  await db.execute("update reservations set expires_at = now() - interval '1 hour'");
+
+  const cookieB = await crearVisita("Bea");
+  await pedirDelMar(cookieB);
+  assertEquals((await recoger(vista.id, cookieB)).status, 200);
+});
+
+Deno.test("Destruir mi botella reservada libera la reserva", async () => {
+  await db.execute("delete from bottles");
+  await lanzar({ text: "Botella que destruyo yo" });
+
+  const cookie = await crearVisita("Autora");
+  const { data: vista } = await (await pedirDelMar(cookie)).json();
+  assertEquals((await recoger(vista.id, cookie)).status, 200);
+  assertEquals((await descartar(vista.id, "destroy", cookie)).status, 200);
+
+  const filas = await db.execute("select count(*)::int as total from reservations");
+  assertEquals(filas.rows[0], { total: 0 });
+});
+
+Deno.test("Devolver al mar libera mi reserva", async () => {
+  await db.execute("delete from bottles");
+  await lanzar({ text: "Botella que devuelvo reservada" });
+
+  const cookie = await crearVisita("Autora");
+  const { data: vista } = await (await pedirDelMar(cookie)).json();
+  assertEquals((await recoger(vista.id, cookie)).status, 200);
+  assertEquals((await descartar(vista.id, "return", cookie)).status, 200);
+
+  const filas = await db.execute("select count(*)::int as total from reservations");
+  assertEquals(filas.rows[0], { total: 0 });
+});
+
+Deno.test("Tres emojis se rechazan por cortos, no revientan", async () => {
+  const res = await lanzar({ text: "🙂🙂🙂" });
+
+  assertEquals(res.status, 422);
+});
+
+Deno.test("Cinco emojis se aceptan", async () => {
+  const res = await lanzar({ text: "🙂🙂🙂🙂🙂" });
+
+  assertEquals(res.status, 201);
+});
+
+Deno.test("Un texto con byte NUL responde 422", async () => {
+  const res = await lanzar({ text: "hola\u0000mundo" });
+
+  assertEquals(res.status, 422);
+});
+
+Deno.test("Rechaza un alias invisible", async () => {
+  const res = await ponerPerfil("\u200b\u200b\u200b");
+
+  assertEquals(res.status, 422);
+});
+
+Deno.test("Ver el mar sin perfil no quema la botella", async () => {
+  await db.execute("delete from bottles");
+  await lanzar({ text: "Botella no quemada" });
+
+  const sinPerfil = await pedirDelMar();
+  const cookie = (sinPerfil.headers.get("set-cookie") ?? "").split(";")[0];
+
+  await ponerPerfil("Tarde", cookie);
+
+  const { data } = await (await pedirDelMar(cookie)).json();
+  assertEquals(data.text, "Botella no quemada");
+});
+
+// ------------------------------------------------------------------------- 5
+const enviarMensaje = (id: number, text: unknown, cookie?: string) =>
+  app.request(`/api/bottles/${id}/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...(cookie ? { cookie } : {}) },
+    body: JSON.stringify({ text }),
+  });
+
+const leerMensajes = (id: number, cookie?: string, query = "") =>
+  app.request(`/api/bottles/${id}/messages${query}`, {
+    headers: cookie ? { cookie } : {},
+  });
+
+const prepararConversacion = async () => {
+  await db.execute("delete from bottles");
+  const cookieAutora = await crearVisita("Ana");
+  await lanzar({ text: "Botella de Ana" }, cookieAutora);
+
+  const cookieLectora = await crearVisita("Bea");
+  const { data: vista } = await (await pedirDelMar(cookieLectora)).json();
+  assertEquals((await recoger(vista.id, cookieLectora)).status, 200);
+
+  return { cookieAutora, cookieLectora, vista };
+};
+
+Deno.test("Mi primer mensaje fija la conversación y la botella no vuelve al mar", async () => {
+  const { cookieLectora, vista } = await prepararConversacion();
+
+  const res = await enviarMensaje(vista.id, "Hola, me gustó tu botella", cookieLectora);
+  assertEquals(res.status, 201);
+
+  // Solo caducan las reservas sin confirmar; la conversación fija tiene expiración infinita.
+  await db.execute("update reservations set expires_at = now() - interval '1 hour' where confirmed_at is null");
+
+  const otra = await pedirDelMar();
+  assertEquals((await otra.json()).data, null);
+});
+
+Deno.test("El autor no puede escribir antes del primer mensaje", async () => {
+  const { cookieAutora, vista } = await prepararConversacion();
+
+  assertEquals((await enviarMensaje(vista.id, "Escribo yo primero", cookieAutora)).status, 403);
+});
+
+Deno.test("Quien recoge lee el chat vacío y el autor no", async () => {
+  const { cookieAutora, cookieLectora, vista } = await prepararConversacion();
+
+  const lectora = await leerMensajes(vista.id, cookieLectora);
+  assertEquals(lectora.status, 200);
+  assertEquals((await lectora.json()).data, []);
+
+  assertEquals((await leerMensajes(vista.id, cookieAutora)).status, 403);
+});
+
+Deno.test("Tras el primer mensaje el autor responde y ambos leen", async () => {
+  const { cookieAutora, cookieLectora, vista } = await prepararConversacion();
+  await enviarMensaje(vista.id, "Hola desde el mar", cookieLectora);
+
+  const respuesta = await enviarMensaje(vista.id, "Hola Bea, encantada", cookieAutora);
+  assertEquals(respuesta.status, 201);
+
+  const { data: deLectora } = await (await leerMensajes(vista.id, cookieLectora)).json();
+  assertEquals(deLectora.length, 2);
+  assertEquals(deLectora[0].alias, "Bea");
+  assertEquals(deLectora[0].mine, true);
+  assertEquals(deLectora[1].alias, "Ana");
+  assertEquals(deLectora[1].mine, false);
+
+  const { data: deAutora } = await (await leerMensajes(vista.id, cookieAutora)).json();
+  assertEquals(deAutora[0].mine, false);
+  assertEquals(deAutora[1].mine, true);
+});
+
+Deno.test("Un tercero no puede leer ni escribir la conversación", async () => {
+  const { cookieLectora, vista } = await prepararConversacion();
+  await enviarMensaje(vista.id, "Hola desde el mar", cookieLectora);
+
+  const cookieTercera = await crearVisita("Carol");
+
+  assertEquals((await leerMensajes(vista.id, cookieTercera)).status, 403);
+  assertEquals((await enviarMensaje(vista.id, "Me cuelo", cookieTercera)).status, 403);
+});
+
+Deno.test("Valida los mensajes: vacío, 501 caracteres y 500 emojis", async () => {
+  const { cookieLectora, vista } = await prepararConversacion();
+
+  assertEquals((await enviarMensaje(vista.id, "", cookieLectora)).status, 422);
+  assertEquals((await enviarMensaje(vista.id, "a".repeat(501), cookieLectora)).status, 422);
+  assertEquals((await enviarMensaje(vista.id, "🙂".repeat(500), cookieLectora)).status, 201);
+});
+
+Deno.test("Una botella con conversación fija no se puede destruir ni devolver", async () => {
+  const { cookieLectora, vista } = await prepararConversacion();
+  await enviarMensaje(vista.id, "Hola desde el mar", cookieLectora);
+
+  assertEquals((await descartar(vista.id, "destroy", cookieLectora)).status, 409);
+  assertEquals((await descartar(vista.id, "return", cookieLectora)).status, 409);
+});
+
+Deno.test("Una reserva confirmada no se puede liberar", async () => {
+  const { cookieLectora, vista } = await prepararConversacion();
+  await enviarMensaje(vista.id, "Hola desde el mar", cookieLectora);
+
+  assertEquals((await liberar(vista.id, cookieLectora)).status, 409);
+});
+
+Deno.test("Tras fijar la conversación, quien recogió puede recoger otra botella", async () => {
+  const { cookieLectora, vista } = await prepararConversacion();
+  await lanzar({ text: "Otra botella en el mar" });
+  await enviarMensaje(vista.id, "Hola desde el mar", cookieLectora);
+
+  const { data: otra } = await (await pedirDelMar(cookieLectora)).json();
+  assertEquals((await recoger(otra.id, cookieLectora)).status, 200);
+});
+
+Deno.test("Los mensajes se leen de 50 en 50 con ?before", async () => {
+  const { cookieLectora, vista } = await prepararConversacion();
+  for (let i = 1; i <= 55; i++) {
+    await enviarMensaje(vista.id, `Mensaje ${i}`, cookieLectora);
+  }
+
+  const { data: ultimos } = await (await leerMensajes(vista.id, cookieLectora)).json();
+  assertEquals(ultimos.length, 50);
+  assertEquals(ultimos[49].text, "Mensaje 55");
+
+  const { data: anteriores } = await (
+    await leerMensajes(vista.id, cookieLectora, `?before=${ultimos[0].id}`)
+  ).json();
+  assertEquals(anteriores.length, 5);
+  assertEquals(anteriores[4].text, "Mensaje 5");
+});
+
+// ------------------------------------------- arreglos de la cuarta revisión
+Deno.test("Confirmar fija la reserva para siempre", async () => {
+  const { cookieLectora, vista } = await prepararConversacion();
+  await enviarMensaje(vista.id, "Hola desde el mar", cookieLectora);
+
+  const filas = await db.execute(
+    "select confirmed_at is not null as confirmada, expires_at = 'infinity' as infinita from reservations",
+  );
+  assertEquals(filas.rows[0], { confirmada: true, infinita: true });
+});
+
+Deno.test("Descartar sin cookie una conversación fija responde 403, no 409", async () => {
+  const { cookieLectora, vista } = await prepararConversacion();
+  await enviarMensaje(vista.id, "Hola desde el mar", cookieLectora);
+
+  const res = await app.request(`/api/bottles/${vista.id}/discard`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ action: "destroy" }),
+  });
+
+  assertEquals(res.status, 403);
+});
+
+Deno.test("Un ?before inválido responde 422", async () => {
+  const { cookieLectora, vista } = await prepararConversacion();
+  await enviarMensaje(vista.id, "Hola desde el mar", cookieLectora);
+
+  assertEquals((await leerMensajes(vista.id, cookieLectora, "?before=abc")).status, 422);
+});
+
+Deno.test("El alias de un mensaje no cambia al renombrarme", async () => {
+  const { cookieLectora, vista } = await prepararConversacion();
+  await enviarMensaje(vista.id, "Hola desde el mar", cookieLectora);
+  await ponerPerfil("Bego", cookieLectora);
+
+  const { data } = await (await leerMensajes(vista.id, cookieLectora)).json();
+  assertEquals(data[0].alias, "Bea");
+});
+
+Deno.test("Un mensaje con carácter bidi se rechaza", async () => {
+  const { cookieLectora, vista } = await prepararConversacion();
+  await enviarMensaje(vista.id, "Hola desde el mar", cookieLectora);
+
+  const res = await enviarMensaje(vista.id, "Hola\u202Emundo", cookieLectora);
+
+  assertEquals(res.status, 422);
+});
+
+// ------------------------------------------------------------------------- 6
+const miLista = (cookie?: string, query = "") =>
+  app.request(`/api/bottles/mine${query}`, { headers: cookie ? { cookie } : {} });
+
+const botellaDe = async (visitor: string, texto: string) => {
+  const filas = await db.execute(
+    sql`insert into bottles (text, author_visitor) values (${texto}, ${visitor}) returning id`,
+  );
+  return (filas.rows[0] as { id: number }).id;
+};
+
+Deno.test("Mi lista sin botellas devuelve un array vacío", async () => {
+  await db.execute("delete from bottles");
+  const cookie = await crearVisita("Ana");
+
+  const res = await miLista(cookie);
+
+  assertEquals(res.status, 200);
+  assertEquals((await res.json()).data, []);
+});
+
+Deno.test("Mi lista muestra el estado de cada botella", async () => {
+  await db.execute("delete from bottles");
+  const cookie = await crearVisita("Ana");
+  const yo = cookie.split("=")[1];
+  const otra = (await crearVisita("Bea")).split("=")[1];
+
+  const idMar = await botellaDe(yo, "En el mar");
+  const idReservada = await botellaDe(yo, "Reservada");
+  const idConversacion = await botellaDe(yo, "Conversacion");
+  const idDestruida = await botellaDe(yo, "Destruida");
+
+  await db.execute(sql`
+    insert into reservations (bottle_id, visitor_id, expires_at)
+    values (${idReservada}, ${otra}, now() + interval '1 hour')
+  `);
+  await db.execute(sql`
+    insert into reservations (bottle_id, visitor_id, expires_at, confirmed_at)
+    values (${idConversacion}, ${otra}, 'infinity', now())
+  `);
+  await db.execute(sql`update bottles set destroyed_at = now() where id = ${idDestruida}`);
+
+  const { data } = await (await miLista(cookie)).json();
+  const porId = new Map(data.map((b: { id: number; status: string }) => [b.id, b.status]));
+
+  assertEquals(porId.get(idMar), "en_el_mar");
+  assertEquals(porId.get(idReservada), "reservada");
+  assertEquals(porId.get(idConversacion), "conversacion");
+  assertEquals(porId.get(idDestruida), "destruida");
+});
+
+Deno.test("Mi lista no incluye botellas de otras personas", async () => {
+  await db.execute("delete from bottles");
+  const cookie = await crearVisita("Ana");
+  const yo = cookie.split("=")[1];
+  const otra = (await crearVisita("Bea")).split("=")[1];
+
+  await botellaDe(yo, "Botella mía");
+  await botellaDe(otra, "Botella ajena");
+
+  const { data } = await (await miLista(cookie)).json();
+
+  assertEquals(data.length, 1);
+  assertEquals(data[0].text, "Botella mía");
+});
+
+Deno.test("Mi lista expone solo id, texto, estado y fecha", async () => {
+  await db.execute("delete from bottles");
+  const cookie = await crearVisita("Ana");
+  await botellaDe(cookie.split("=")[1], "Botella mía");
+
+  const { data } = await (await miLista(cookie)).json();
+
+  assertEquals(Object.keys(data[0]).sort(), ["createdAt", "id", "status", "text"]);
+});
+
+Deno.test("Una reserva expirada sin mensajes vuelve a estar en el mar", async () => {
+  await db.execute("delete from bottles");
+  const cookie = await crearVisita("Ana");
+  const yo = cookie.split("=")[1];
+  const otra = (await crearVisita("Bea")).split("=")[1];
+
+  const id = await botellaDe(yo, "Reserva caducada");
+  await db.execute(sql`
+    insert into reservations (bottle_id, visitor_id, expires_at)
+    values (${id}, ${otra}, now() - interval '1 hour')
+  `);
+
+  const { data } = await (await miLista(cookie)).json();
+  assertEquals(data[0].status, "en_el_mar");
+});
+
+Deno.test("Mi lista se pagina de 50 en 50 con ?before", async () => {
+  await db.execute("delete from bottles");
+  const cookie = await crearVisita("Ana");
+  const yo = cookie.split("=")[1];
+
+  for (let i = 1; i <= 55; i++) await botellaDe(yo, `Botella ${i}`);
+
+  const { data: ultimas } = await (await miLista(cookie)).json();
+  assertEquals(ultimas.length, 50);
+  assertEquals(ultimas[49].text, "Botella 55");
+
+  const { data: anteriores } = await (await miLista(cookie, `?before=${ultimas[0].id}`)).json();
+  assertEquals(anteriores.length, 5);
+  assertEquals(anteriores[4].text, "Botella 5");
+});
+
+// ------------------------------------------------------------------------- 8
+const correo = () => `persona-${crypto.randomUUID()}@example.com`;
+
+const registrar = (email: string, password: string, cookie?: string) =>
+  app.request("/api/auth/register", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...(cookie ? { cookie } : {}) },
+    body: JSON.stringify({ email, password }),
+  });
+
+const entrar = (email: string, password: string, cookie?: string) =>
+  app.request("/api/auth/login", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...(cookie ? { cookie } : {}) },
+    body: JSON.stringify({ email, password }),
+  });
+
+const conToken = (token: string) => ({ authorization: `Bearer ${token}` });
+
+const limpiarCuentas = async () => {
+  await db.execute("delete from sessions");
+  await db.execute("delete from accounts");
+};
+
+const tokenDe = async (res: Response) => (await res.json()).data.token as string;
+const cookieDe = (res: Response) => (res.headers.get("set-cookie") ?? "").split(";")[0];
+
+Deno.test("Registro devuelve token y email, y /me lo confirma", async () => {
+  await limpiarCuentas();
+  const email = correo();
+
+  const res = await registrar(email, "contraseña-larga");
+
+  assertEquals(res.status, 201);
+  const { data } = await res.json();
+  assertEquals(Object.keys(data).sort(), ["email", "token"]);
+  assertEquals(data.email, email);
+
+  const me = await app.request("/api/auth/me", { headers: conToken(data.token) });
+  assertEquals(me.status, 200);
+  assertEquals((await me.json()).data.email, email);
+});
+
+Deno.test("Registro sin cookie reparte visitante y lo adopta", async () => {
+  await limpiarCuentas();
+  const email = correo();
+
+  const res = await registrar(email, "contraseña-larga");
+  const cookie = cookieDe(res);
+  assertMatch(cookie, /^visitor=/);
+
+  const filas = await db.execute("select visitor_id from accounts");
+  assertEquals(filas.rows[0].visitor_id, cookie.split("=")[1]);
+});
+
+Deno.test("Registro con la cookie de una cuenta existente responde 409", async () => {
+  await limpiarCuentas();
+
+  const alta = await registrar(correo(), "contraseña-larga");
+  const cookie = cookieDe(alta);
+
+  const res = await registrar(correo(), "otra-contraseña", cookie);
+
+  assertEquals(res.status, 409);
+});
+
+Deno.test("Email duplicado, también con distinto caso, responde 409", async () => {
+  await limpiarCuentas();
+  const email = correo();
+  await registrar(email, "contraseña-larga");
+
+  assertEquals((await registrar(email.toUpperCase(), "contraseña-larga")).status, 409);
+});
+
+Deno.test("Dos registros concurrentes con el mismo email dejan una sola cuenta", async () => {
+  await limpiarCuentas();
+  const email = correo();
+
+  const [a, b] = await Promise.all([
+    registrar(email, "contraseña-larga"),
+    registrar(email, "contraseña-larga"),
+  ]);
+
+  assertEquals([a.status, b.status].sort(), [201, 409]);
+  const filas = await db.execute("select count(*)::int as total from accounts");
+  assertEquals(filas.rows[0], { total: 1 });
+});
+
+Deno.test("Rechaza contraseñas cortas, largas y emails inválidos", async () => {
+  await limpiarCuentas();
+
+  assertEquals((await registrar(correo(), "1234567")).status, 422);
+  assertEquals((await registrar(correo(), "🙂".repeat(129))).status, 422);
+  assertEquals((await registrar("no-es-email", "contraseña-larga")).status, 422);
+});
+
+Deno.test("Login con email en mayúsculas y con espacios funciona", async () => {
+  await limpiarCuentas();
+  const email = correo();
+  await registrar(email, "contraseña-larga");
+
+  const res = await entrar(`  ${email.toUpperCase()}  `, "contraseña-larga");
+
+  assertEquals(res.status, 200);
+  assertMatch((await res.json()).data.token, /^[A-Za-z0-9_-]{43}$/);
+});
+
+Deno.test("Contraseña incorrecta y email inexistente dan el mismo 401", async () => {
+  await limpiarCuentas();
+  const email = correo();
+  await registrar(email, "contraseña-larga");
+
+  const mala = await entrar(email, "contraseña-mala");
+  const inexistente = await entrar(correo(), "contraseña-mala");
+
+  assertEquals(mala.status, 401);
+  assertEquals(inexistente.status, 401);
+  assertEquals(await mala.text(), await inexistente.text());
+
+  const filas = await db.execute("select count(*)::int as total from sessions where account_id is null");
+  assertEquals(filas.rows[0], { total: 0 });
+});
+
+Deno.test("En la base no hay contraseñas ni tokens en claro", async () => {
+  await limpiarCuentas();
+  const password = "contraseña-larga";
+  const res = await registrar(correo(), password);
+  const token = await tokenDe(res);
+
+  const cuentas = await db.execute("select password_hash from accounts");
+  const hash = cuentas.rows[0].password_hash as string;
+  assertEquals(hash === password, false);
+  assertMatch(hash, /^pbkdf2-sha256\$600000\$/);
+
+  const sesiones = await db.execute("select token_hash from sessions");
+  assertEquals(sesiones.rows[0].token_hash === token, false);
+
+  // El digest guardado no sirve como credencial
+  const conDigest = await app.request("/api/auth/me", {
+    headers: conToken(sesiones.rows[0].token_hash as string),
+  });
+  assertEquals(conDigest.status, 401);
+});
+
+Deno.test("El registro conserva la historia anónima", async () => {
+  await limpiarCuentas();
+  await db.execute("delete from bottles");
+
+  const cookie = await crearVisita("Ana");
+  await lanzar({ text: "Botella que viaja conmigo" }, cookie);
+
+  const res = await registrar(correo(), "contraseña-larga", cookie);
+  const token = await tokenDe(res);
+
+  const mine = await app.request("/api/bottles/mine", { headers: conToken(token) });
+  const { data } = await mine.json();
+  assertEquals(data.length, 1);
+  assertEquals(data[0].text, "Botella que viaja conmigo");
+
+  const perfil = await app.request("/api/profile", { headers: conToken(token) });
+  assertEquals((await perfil.json()).data.alias, "Ana");
+});
+
+Deno.test("La cookie sola de una cuenta responde 401 en todas las rutas", async () => {
+  await limpiarCuentas();
+  const alta = await registrar(correo(), "contraseña-larga");
+  const cookie = cookieDe(alta);
+
+  for (const ruta of ["/api/sea", "/api/bottles/mine", "/api/profile"]) {
+    assertEquals((await app.request(ruta, { headers: { cookie } })).status, 401);
+  }
+  assertEquals(
+    (await app.request("/api/bottles/1/messages", { headers: { cookie } })).status,
+    401,
+  );
+});
+
+Deno.test("La cookie de cuenta en mayúsculas también responde 401", async () => {
+  await limpiarCuentas();
+  const alta = await registrar(correo(), "contraseña-larga");
+  const [nombre, valor] = cookieDe(alta).split("=");
+
+  const res = await app.request("/api/sea", {
+    headers: { cookie: `${nombre}=${valor.toUpperCase()}` },
+  });
+
+  assertEquals(res.status, 401);
+});
+
+Deno.test("Tokens basura, caducados o con otro pimiento responden 401", async () => {
+  await limpiarCuentas();
+  const res = await registrar(correo(), "contraseña-larga");
+  const token = await tokenDe(res);
+
+  assertEquals((await app.request("/api/auth/me", { headers: conToken("basura") })).status, 401);
+
+  await db.execute("update sessions set expires_at = now() - interval '1 hour'");
+  assertEquals((await app.request("/api/auth/me", { headers: conToken(token) })).status, 401);
+});
+
+Deno.test("Logout invalida su token y deja viva la otra sesión", async () => {
+  await limpiarCuentas();
+  const email = correo();
+  await registrar(email, "contraseña-larga");
+  const tokenA = await tokenDe(await entrar(email, "contraseña-larga"));
+  const tokenB = await tokenDe(await entrar(email, "contraseña-larga"));
+
+  const salida = await app.request("/api/auth/logout", {
+    method: "POST",
+    headers: conToken(tokenA),
+  });
+  assertEquals(salida.status, 204);
+
+  assertEquals((await app.request("/api/auth/me", { headers: conToken(tokenA) })).status, 401);
+  assertEquals((await app.request("/api/auth/me", { headers: conToken(tokenB) })).status, 200);
+});
+
+Deno.test("Logout-all invalida todas las sesiones de la cuenta", async () => {
+  await limpiarCuentas();
+  const email = correo();
+  await registrar(email, "contraseña-larga");
+  const tokenA = await tokenDe(await entrar(email, "contraseña-larga"));
+  const tokenB = await tokenDe(await entrar(email, "contraseña-larga"));
+
+  const salida = await app.request("/api/auth/logout-all", {
+    method: "POST",
+    headers: conToken(tokenA),
+  });
+  assertEquals(salida.status, 204);
+
+  assertEquals((await app.request("/api/auth/me", { headers: conToken(tokenA) })).status, 401);
+  assertEquals((await app.request("/api/auth/me", { headers: conToken(tokenB) })).status, 401);
+});
+
+Deno.test("Logout limpia la cookie y el dispositivo vuelve a ser anónimo", async () => {
+  await limpiarCuentas();
+  const alta = await registrar(correo(), "contraseña-larga");
+  const token = await tokenDe(alta);
+  const cookie = cookieDe(alta);
+
+  const salida = await app.request("/api/auth/logout", {
+    method: "POST",
+    headers: { ...conToken(token), cookie },
+  });
+
+  assertEquals(salida.status, 204);
+  assertMatch(salida.headers.get("set-cookie") ?? "", /^visitor=;.*Max-Age=0/);
+
+  const mar = await app.request("/api/sea");
+  assertEquals(mar.status, 200);
+  assertMatch(mar.headers.get("set-cookie") ?? "", /^visitor=[0-9a-f-]{36}/);
+});
+
+Deno.test("Con token válido se ignora la cookie ajena y no se emite Set-Cookie", async () => {
+  await limpiarCuentas();
+  await db.execute("delete from bottles");
+  const alta = await registrar(correo(), "contraseña-larga");
+  const token = await tokenDe(alta);
+  const cookieAjena = await crearVisita("Otra");
+  await lanzar({ text: "Botella de otra persona" }, cookieAjena);
+
+  const mar = await app.request("/api/sea", { headers: { ...conToken(token), cookie: cookieAjena } });
+  assertEquals(mar.status, 200);
+  assertEquals(mar.headers.get("set-cookie"), null);
+
+  const perfil = await app.request("/api/profile", {
+    method: "PUT",
+    headers: { "content-type": "application/json", ...conToken(token), cookie: cookieAjena },
+    body: JSON.stringify({ alias: "Cuenta" }),
+  });
+  assertEquals(perfil.status, 200);
+  assertEquals(perfil.headers.get("set-cookie"), null);
+});
+
+Deno.test("Token inválido con cookie de cuenta no degrada a cookie", async () => {
+  await limpiarCuentas();
+  const alta = await registrar(correo(), "contraseña-larga");
+  const cookie = cookieDe(alta);
+
+  const res = await app.request("/api/sea", {
+    headers: { authorization: "Bearer basura", cookie },
+  });
+
+  assertEquals(res.status, 401);
+});
+
+Deno.test("Una cookie anónima malformada se ignora, no da 401", async () => {
+  await limpiarCuentas();
+  await db.execute("delete from bottles");
+  await lanzar({ text: "Botella anónima" });
+
+  const res = await app.request("/api/sea", { headers: { cookie: "visitor=basura" } });
+
+  assertEquals(res.status, 200);
+  assertMatch(res.headers.get("set-cookie") ?? "", /^visitor=[0-9a-f-]{36}/);
+});
+
+Deno.test("El cupo de 5 al día se comparte entre dispositivos", async () => {
+  await limpiarCuentas();
+  await db.execute("delete from bottles");
+  const email = correo();
+  const alta = await registrar(email, "contraseña-larga");
+  const token = await tokenDe(alta);
+
+  const cookie = cookieDe(alta);
+  await app.request("/api/profile", {
+    method: "PUT",
+    headers: { "content-type": "application/json", ...conToken(token) },
+    body: JSON.stringify({ alias: "Ana" }),
+  });
+
+  for (let i = 1; i <= 5; i++) {
+    const res = await app.request("/api/bottles", {
+      method: "POST",
+      headers: { "content-type": "application/json", ...conToken(token) },
+      body: JSON.stringify({ text: `Botella ${i}` }),
+    });
+    assertEquals(res.status, 201);
+  }
+
+  // "Otro dispositivo": login limpio, sin la cookie del primero
+  const tokenB = await tokenDe(await entrar(email, "contraseña-larga"));
+
+  const sexta = await app.request("/api/bottles", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...conToken(tokenB) },
+    body: JSON.stringify({ text: "Botella seis" }),
+  });
+
+  assertEquals(sexta.status, 429);
+  assertEquals(cookie.split("=")[1].length, 36);
+});
+
+Deno.test("El rate limit corta a los 11 intentos del mismo email", async () => {
+  await limpiarCuentas();
+  resetRateLimit();
+  const email = correo();
+  await registrar(email, "contraseña-larga");
+
+  const estados: number[] = [];
+  for (let i = 0; i < 11; i++) {
+    estados.push((await entrar(i % 2 === 0 ? email : email.toUpperCase(), "mala")).status);
+  }
+
+  assertEquals(estados.slice(0, 10), Array(10).fill(401));
+  assertEquals(estados[10], 429);
+  assertEquals((await entrar(correo(), "mala")).status, 401);
+
+  resetRateLimit();
+});
+
+// ------------------------------------------------------------------------- 9
+const ponerPerfilBio = (alias: unknown, bio: unknown, cookie: string) =>
+  app.request("/api/profile", {
+    method: "PUT",
+    headers: { "content-type": "application/json", cookie },
+    body: JSON.stringify({ alias, bio }),
+  });
+
+const darVisitaConPerfil = async (alias: string) => {
+  const cookie = await crearVisita(alias);
+  return cookie;
+};
+
+const visitanteCompleto = async (alias: string) => {
+  const cookie = await crearVisita(alias);
+  const { data } = await (await app.request("/api/profile", { headers: { cookie } })).json();
+  return { cookie, visitorId: cookie.split("=")[1], publicId: data.publicId as string };
+};
+
+const bloquear = (publicId: string, cookie: string) =>
+  app.request("/api/blocks", {
+    method: "POST",
+    headers: { "content-type": "application/json", cookie },
+    body: JSON.stringify({ publicId }),
+  });
+
+const desbloquear = (publicId: string, cookie: string) =>
+  app.request(`/api/blocks/${publicId}`, { method: "DELETE", headers: { cookie } });
+
+const misBloqueos = (cookie: string) => app.request("/api/blocks", { headers: { cookie } });
+
+const reportar = (body: unknown, cookie: string) =>
+  app.request("/api/reports", {
+    method: "POST",
+    headers: { "content-type": "application/json", cookie },
+    body: JSON.stringify(body),
+  });
+
+const limpiarBloqueos = async () => {
+  await db.execute("delete from blocks");
+  await db.execute("delete from reports");
+};
+
+Deno.test("Bloquear oculta las botellas en ambos sentidos y un tercero las sigue viendo", async () => {
+  await limpiarBloqueos();
+  await db.execute("delete from bottles");
+
+  const ana = await visitanteCompleto("Ana");
+  const bea = await visitanteCompleto("Bea");
+  await lanzar({ text: "Botella de Ana" }, ana.cookie);
+  await lanzar({ text: "Botella de Bea" }, bea.cookie);
+
+  const antes = await (await pedirDelMar(ana.cookie)).json();
+  assertEquals(antes.data.text, "Botella de Bea");
+
+  assertEquals((await bloquear(bea.publicId, ana.cookie)).status, 201);
+
+  assertEquals((await (await pedirDelMar(ana.cookie)).json()).data, null);
+  assertEquals((await (await pedirDelMar(bea.cookie)).json()).data, null);
+
+  const carla = await visitanteCompleto("Carla");
+  const tercera = await (await pedirDelMar(carla.cookie)).json();
+  assertEquals(["Botella de Ana", "Botella de Bea"].includes(tercera.data.text), true);
+});
+
+Deno.test("El chat responde 403 en ambos sentidos y el historial sigue guardado", async () => {
+  await limpiarBloqueos();
+  const { cookieAutora, cookieLectora, vista } = await prepararConversacion();
+  await enviarMensaje(vista.id, "Hola desde el mar", cookieLectora);
+  const lectoraCompleta = (await (await app.request("/api/profile", { headers: { cookie: cookieLectora } })).json()).data;
+
+  assertEquals((await bloquear(lectoraCompleta.publicId, cookieAutora)).status, 201);
+
+  for (const cookie of [cookieAutora, cookieLectora]) {
+    assertEquals((await leerMensajes(vista.id, cookie)).status, 403);
+    assertEquals((await enviarMensaje(vista.id, "Sigo aquí", cookie)).status, 403);
+  }
+
+  const filas = await db.execute("select count(*)::int as total from messages");
+  assertEquals(filas.rows[0], { total: 1 });
+});
+
+Deno.test("No puedo recoger ni descartar una botella de alguien bloqueado", async () => {
+  await limpiarBloqueos();
+  await db.execute("delete from bottles");
+  const ana = await visitanteCompleto("Ana");
+  const bea = await visitanteCompleto("Bea");
+  await lanzar({ text: "Botella de Ana" }, ana.cookie);
+
+  const { data: vista } = await (await pedirDelMar(bea.cookie)).json();
+  await bloquear(bea.publicId, ana.cookie);
+
+  assertEquals((await recoger(vista.id, bea.cookie)).status, 403);
+  assertEquals((await descartar(vista.id, "destroy", bea.cookie)).status, 403);
+});
+
+Deno.test("Desbloquear restaura el mar y el chat", async () => {
+  await limpiarBloqueos();
+  await db.execute("delete from bottles");
+  const ana = await visitanteCompleto("Ana");
+  const bea = await visitanteCompleto("Bea");
+
+  await bloquear(bea.publicId, ana.cookie);
+  await lanzar({ text: "Botella nueva de Bea" }, bea.cookie);
+  assertEquals((await (await pedirDelMar(ana.cookie)).json()).data, null);
+
+  assertEquals((await desbloquear(bea.publicId, ana.cookie)).status, 204);
+  assertEquals((await (await pedirDelMar(ana.cookie)).json()).data.text, "Botella nueva de Bea");
+});
+
+Deno.test("Si los dos se bloquearon, mi desbloqueo no basta", async () => {
+  await limpiarBloqueos();
+  const ana = await visitanteCompleto("Ana");
+  const bea = await visitanteCompleto("Bea");
+
+  await bloquear(bea.publicId, ana.cookie);
+  await bloquear(ana.publicId, bea.cookie);
+  await desbloquear(bea.publicId, ana.cookie);
+
+  await db.execute("delete from bottles");
+  await lanzar({ text: "Botella de Bea" }, bea.cookie);
+
+  assertEquals((await (await pedirDelMar(ana.cookie)).json()).data, null);
+});
+
+Deno.test("Bloquear libera una reserva sin confirmar y la botella vuelve al mar", async () => {
+  await limpiarBloqueos();
+  await db.execute("delete from bottles");
+  const ana = await visitanteCompleto("Ana");
+  const bea = await visitanteCompleto("Bea");
+  await lanzar({ text: "Botella en disputa" }, ana.cookie);
+
+  const { data: vista } = await (await pedirDelMar(bea.cookie)).json();
+  assertEquals((await recoger(vista.id, bea.cookie)).status, 200);
+
+  await bloquear(bea.publicId, ana.cookie);
+
+  const reservas = await db.execute("select count(*)::int as total from reservations");
+  assertEquals(reservas.rows[0], { total: 0 });
+
+  const carla = await visitanteCompleto("Carla");
+  assertEquals((await (await pedirDelMar(carla.cookie)).json()).data.text, "Botella en disputa");
+});
+
+Deno.test("Bloquear con conversación confirmada no deja escribir ni confirmar nada", async () => {
+  await limpiarBloqueos();
+  const { cookieAutora, cookieLectora, vista } = await prepararConversacion();
+  await enviarMensaje(vista.id, "Hola desde el mar", cookieLectora);
+  const autora = (await (await app.request("/api/profile", { headers: { cookie: cookieAutora } })).json()).data;
+
+  await bloquear(autora.publicId, cookieLectora);
+
+  assertEquals((await enviarMensaje(vista.id, "Mensaje bloqueado", cookieLectora)).status, 403);
+  const filas = await db.execute("select count(*)::int as total from messages");
+  assertEquals(filas.rows[0], { total: 1 });
+});
+
+Deno.test("No puedo bloquearme ni reportarme, y un publicId inexistente da 404", async () => {
+  await limpiarBloqueos();
+  const ana = await visitanteCompleto("Ana");
+  const fantasma = crypto.randomUUID();
+
+  assertEquals((await bloquear(ana.publicId, ana.cookie)).status, 422);
+  assertEquals((await reportar({ publicId: ana.publicId, reason: "spam" }, ana.cookie)).status, 422);
+  assertEquals((await bloquear(fantasma, ana.cookie)).status, 404);
+  assertEquals((await reportar({ publicId: fantasma, reason: "spam" }, ana.cookie)).status, 404);
+});
+
+Deno.test("Bloquear dos veces es idempotente", async () => {
+  await limpiarBloqueos();
+  const ana = await visitanteCompleto("Ana");
+  const bea = await visitanteCompleto("Bea");
+
+  assertEquals((await bloquear(bea.publicId, ana.cookie)).status, 201);
+  assertEquals((await bloquear(bea.publicId, ana.cookie)).status, 201);
+
+  const filas = await db.execute("select count(*)::int as total from blocks");
+  assertEquals(filas.rows[0], { total: 1 });
+});
+
+Deno.test("Mi lista de bloqueos expone publicId y alias, nunca el UUID del visitante", async () => {
+  await limpiarBloqueos();
+  const ana = await visitanteCompleto("Ana");
+  const bea = await visitanteCompleto("Bea");
+  await bloquear(bea.publicId, ana.cookie);
+
+  const { data } = await (await misBloqueos(ana.cookie)).json();
+  assertEquals(data.length, 1);
+  assertEquals(Object.keys(data[0]).sort(), ["alias", "publicId"]);
+  assertEquals(data[0].alias, "Bea");
+  assertEquals(data[0].publicId, bea.publicId);
+  assertEquals(data[0].publicId === bea.visitorId, false);
+
+  await ponerPerfil("Bego", bea.cookie);
+  const { data: despues } = await (await misBloqueos(ana.cookie)).json();
+  assertEquals(despues[0].publicId, bea.publicId);
+  assertEquals(despues[0].alias, "Bego");
+});
+
+Deno.test("Un reporte se guarda con motivo, texto y botella", async () => {
+  await limpiarBloqueos();
+  await db.execute("delete from bottles");
+  const ana = await visitanteCompleto("Ana");
+  const bea = await visitanteCompleto("Bea");
+  const { data: botella } = await (await lanzar({ text: "Botella reportada" }, bea.cookie)).json();
+
+  const res = await reportar(
+    { publicId: bea.publicId, reason: "acoso", text: "Me escribió cosas feas", bottleId: botella.id },
+    ana.cookie,
+  );
+  assertEquals(res.status, 201);
+
+  const filas = await db.execute("select reporter_id, reported_id, reason, text, bottle_id from reports");
+  assertEquals(filas.rows[0], {
+    reporter_id: ana.visitorId,
+    reported_id: bea.visitorId,
+    reason: "acoso",
+    text: "Me escribió cosas feas",
+    bottle_id: botella.id,
+  });
+});
+
+Deno.test("Rechaza reportes con motivo inventado, texto inválido o botella inexistente", async () => {
+  await limpiarBloqueos();
+  const ana = await visitanteCompleto("Ana");
+  const bea = await visitanteCompleto("Bea");
+
+  assertEquals((await reportar({ publicId: bea.publicId, reason: "no-existe" }, ana.cookie)).status, 422);
+  assertEquals((await reportar({ publicId: bea.publicId, reason: "spam", text: "a".repeat(501) }, ana.cookie)).status, 422);
+  assertEquals((await reportar({ publicId: bea.publicId, reason: "spam", text: "Hola\u202Emundo" }, ana.cookie)).status, 422);
+  assertEquals((await reportar({ publicId: bea.publicId, reason: "spam", bottleId: 999999 }, ana.cookie)).status, 422);
+});
+
+Deno.test("Reportar no bloquea", async () => {
+  await limpiarBloqueos();
+  const { cookieAutora, cookieLectora, vista } = await prepararConversacion();
+  await enviarMensaje(vista.id, "Hola desde el mar", cookieLectora);
+  const autora = (await (await app.request("/api/profile", { headers: { cookie: cookieAutora } })).json()).data;
+
+  await reportar({ publicId: autora.publicId, reason: "spam" }, cookieLectora);
+
+  assertEquals((await leerMensajes(vista.id, cookieLectora)).status, 200);
+  const filas = await db.execute("select count(*)::int as total from blocks");
+  assertEquals(filas.rows[0], { total: 0 });
+});
+
+Deno.test("Más de diez reportes al día responden 429", async () => {
+  await limpiarBloqueos();
+  resetReportLimit();
+  const ana = await visitanteCompleto("Ana");
+  const bea = await visitanteCompleto("Bea");
+
+  for (let i = 0; i < 10; i++) {
+    assertEquals((await reportar({ publicId: bea.publicId, reason: "spam" }, ana.cookie)).status, 201);
+  }
+
+  assertEquals((await reportar({ publicId: bea.publicId, reason: "spam" }, ana.cookie)).status, 429);
+  resetReportLimit();
+});
+
+Deno.test("Bloquear funciona con identidad de cuenta", async () => {
+  await limpiarBloqueos();
+  await limpiarCuentas();
+  const bea = await visitanteCompleto("Bea");
+  const alta = await registrar(correo(), "contraseña-larga");
+  const token = await tokenDe(alta);
+
+  await app.request("/api/profile", {
+    method: "PUT",
+    headers: { "content-type": "application/json", ...conToken(token) },
+    body: JSON.stringify({ alias: "Cuenta" }),
+  });
+
+  const res = await app.request("/api/blocks", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...conToken(token) },
+    body: JSON.stringify({ publicId: bea.publicId }),
+  });
+  assertEquals(res.status, 201);
+});
+
+// ------------------------------------------------------------------------- 7
+const UPLOADS_TEST = "./data/test-uploads";
+
+const png = (extra = 0) => {
+  const bytes = new Uint8Array(8 + extra);
+  bytes.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  return bytes;
+};
+
+const jpeg = (extra = 4) => {
+  const bytes = new Uint8Array(3 + extra);
+  bytes.set([0xff, 0xd8, 0xff]);
+  return bytes;
+};
+
+const subirFoto = (bytes: Uint8Array, tipo: string, cookie: string) => {
+  const form = new FormData();
+  form.append("photo", new File([bytes as unknown as BlobPart], "foto.bin", { type: tipo }));
+  return app.request("/api/profile/photos", { method: "POST", headers: { cookie }, body: form });
+};
+
+const limpiarFotos = async () => {
+  await db.execute("delete from photos");
+  try {
+    for await (const entrada of Deno.readDir(UPLOADS_TEST)) {
+      await Deno.remove(`${UPLOADS_TEST}/${entrada.name}`);
+    }
+  } catch {
+    // el directorio aún no existe
+  }
+  resetUploadLimit();
+};
+
+const archivosSubidos = async () => {
+  const nombres: string[] = [];
+  try {
+    for await (const entrada of Deno.readDir(UPLOADS_TEST)) nombres.push(entrada.name);
+  } catch {
+    // sin directorio
+  }
+  return nombres;
+};
+
+Deno.test("Subir una foto la guarda y se sirve con su tipo real", async () => {
+  await limpiarFotos();
+  const cookie = await crearVisita("Ana");
+  const bytes = png(32);
+
+  const res = await subirFoto(bytes, "image/png", cookie);
+  assertEquals(res.status, 201);
+  const { data } = await res.json();
+
+  const foto = await app.request(`/api/photos/${data.id}`);
+  assertEquals(foto.status, 200);
+  assertEquals(foto.headers.get("content-type"), "image/png");
+  assertEquals(foto.headers.get("x-content-type-options"), "nosniff");
+  assertEquals(new Uint8Array(await foto.arrayBuffer()), bytes);
+
+  const nombres = await archivosSubidos();
+  assertEquals(nombres.length, 1);
+  assertEquals(nombres[0].includes("foto.bin"), false);
+  assertMatch(nombres[0], /^[0-9a-f-]{36}\.png$/);
+});
+
+Deno.test("El tipo sale de los bytes, no del Content-Type", async () => {
+  await limpiarFotos();
+  const cookie = await crearVisita("Ana");
+
+  const disfrazado = await subirFoto(new TextEncoder().encode("<html>hola</html>"), "image/png", cookie);
+  assertEquals(disfrazado.status, 422);
+
+  const sinTipo = await subirFoto(png(16), "text/plain", cookie);
+  assertEquals(sinTipo.status, 201);
+  const { data } = await sinTipo.json();
+  const foto = await app.request(`/api/photos/${data.id}`);
+  assertEquals(foto.headers.get("content-type"), "image/png");
+});
+
+Deno.test("Rechaza firmas incompletas o mal formadas", async () => {
+  await limpiarFotos();
+  const cookie = await crearVisita("Ana");
+
+  assertEquals((await subirFoto(new Uint8Array([0x89, 0x50, 0x4e, 0x47]), "image/png", cookie)).status, 422);
+  assertEquals((await subirFoto(new Uint8Array([0xff, 0xd8]), "image/jpeg", cookie)).status, 422);
+
+  const riffMalo = new Uint8Array(12);
+  riffMalo.set([0x52, 0x49, 0x46, 0x46, 0xff, 0xff, 0xff, 0xff, 0x57, 0x45, 0x42, 0x50]);
+  assertEquals((await subirFoto(riffMalo, "image/webp", cookie)).status, 422);
+});
+
+Deno.test("Acepta 5 MB y rechaza 5 MB más uno", async () => {
+  await limpiarFotos();
+  const cookie = await crearVisita("Ana");
+
+  const grande = png(5 * 1024 * 1024 - 16);
+  assertEquals((await subirFoto(grande, "image/png", cookie)).status, 201);
+
+  const demasiado = png(5 * 1024 * 1024);
+  assertEquals((await subirFoto(demasiado, "image/png", cookie)).status, 413);
+});
+
+Deno.test("Dos subidas simultáneas en el límite de 6 respetan el tope", async () => {
+  await limpiarFotos();
+  const cookie = await crearVisita("Ana");
+  for (let i = 0; i < 5; i++) await subirFoto(jpeg(), "image/jpeg", cookie);
+
+  const [a, b] = await Promise.all([
+    subirFoto(jpeg(), "image/jpeg", cookie),
+    subirFoto(jpeg(), "image/jpeg", cookie),
+  ]);
+
+  assertEquals([a.status, b.status].sort(), [201, 409]);
+  const filas = await db.execute("select count(*)::int as total from photos");
+  assertEquals(filas.rows[0], { total: 6 });
+  assertEquals((await archivosSubidos()).length, 6);
+});
+
+Deno.test("Borrar mi foto quita la fila, el archivo y responde 404 después", async () => {
+  await limpiarFotos();
+  const cookie = await crearVisita("Ana");
+  const { data } = await (await subirFoto(png(8), "image/png", cookie)).json();
+
+  assertEquals((await app.request(`/api/profile/photos/${data.id}`, { method: "DELETE", headers: { cookie } })).status, 204);
+  assertEquals((await app.request(`/api/photos/${data.id}`)).status, 404);
+  assertEquals((await archivosSubidos()).length, 0);
+  assertEquals((await app.request(`/api/profile/photos/${data.id}`, { method: "DELETE", headers: { cookie } })).status, 404);
+});
+
+Deno.test("No puedo borrar la foto de otra persona", async () => {
+  await limpiarFotos();
+  const ana = await crearVisita("Ana");
+  const bea = await crearVisita("Bea");
+  const { data } = await (await subirFoto(png(8), "image/png", ana)).json();
+
+  assertEquals((await app.request(`/api/profile/photos/${data.id}`, { method: "DELETE", headers: { cookie: bea } })).status, 404);
+});
+
+Deno.test("La bio se guarda, se conserva, se vacía y se valida", async () => {
+  await limpiarFotos();
+  const cookie = await crearVisita("Ana");
+
+  const conBio = await app.request("/api/profile", {
+    method: "PUT",
+    headers: { "content-type": "application/json", cookie },
+    body: JSON.stringify({ alias: "Ana", bio: "Me gusta el mar" }),
+  });
+  assertEquals(conBio.status, 200);
+  assertEquals((await (await app.request("/api/profile", { headers: { cookie } })).json()).data.bio, "Me gusta el mar");
+
+  await ponerPerfil("Ana", cookie);
+  assertEquals((await (await app.request("/api/profile", { headers: { cookie } })).json()).data.bio, "Me gusta el mar");
+
+  const vacia = await app.request("/api/profile", {
+    method: "PUT",
+    headers: { "content-type": "application/json", cookie },
+    body: JSON.stringify({ alias: "Ana", bio: "" }),
+  });
+  assertEquals(vacia.status, 200);
+  assertEquals((await (await app.request("/api/profile", { headers: { cookie } })).json()).data.bio, null);
+
+  assertEquals((await ponerPerfilBio("Ana", "a".repeat(301), cookie)).status, 422);
+  assertEquals((await ponerPerfilBio("Ana", "Hola\u202Emundo", cookie)).status, 422);
+});
+
+Deno.test("Mi perfil expone alias, publicId, bio y fotos ordenadas", async () => {
+  await limpiarFotos();
+  const cookie = await crearVisita("Ana");
+  await subirFoto(png(8), "image/png", cookie);
+  await subirFoto(jpeg(), "image/jpeg", cookie);
+
+  const { data } = await (await app.request("/api/profile", { headers: { cookie } })).json();
+
+  assertEquals(Object.keys(data).sort(), ["alias", "bio", "photos", "publicId"]);
+  assertEquals(data.photos.length, 2);
+  assertEquals(Object.keys(data.photos[0]).sort(), ["id", "url"]);
+});
+
+Deno.test("Al recoger se ven bio y fotos; el mar y el resto no las exponen", async () => {
+  await limpiarFotos();
+  await db.execute("delete from bottles");
+  const ana = await crearVisita("Ana");
+  await app.request("/api/profile", {
+    method: "PUT",
+    headers: { "content-type": "application/json", cookie: ana },
+    body: JSON.stringify({ alias: "Ana", bio: "Mi bio" }),
+  });
+  await subirFoto(png(8), "image/png", ana);
+  await lanzar({ text: "Botella con perfil" }, ana);
+
+  const bea = await darVisitaConPerfil("Bea");
+  const { data: vista } = await (await pedirDelMar(bea)).json();
+  assertEquals("authorBio" in vista, false);
+
+  const { data: recogida } = await (await recoger(vista.id, bea)).json();
+  assertEquals(recogida.authorBio, "Mi bio");
+  assertEquals(recogida.authorPhotos.length, 1);
+
+  const mine = await (await app.request("/api/bottles/mine", { headers: { cookie: ana } })).json();
+  assertEquals(Object.keys(mine.data[0]).sort(), ["createdAt", "id", "status", "text"]);
+});
+
+Deno.test("Subir exige perfil; con cuenta y alias funciona", async () => {
+  await limpiarFotos();
+  const sinPerfil = await pedirDelMar();
+  const cookieSuelta = (sinPerfil.headers.get("set-cookie") ?? "").split(";")[0];
+  assertEquals((await subirFoto(png(8), "image/png", cookieSuelta)).status, 403);
+
+  const alta = await registrar(correo(), "contraseña-larga");
+  const token = await tokenDe(alta);
+  await app.request("/api/profile", {
+    method: "PUT",
+    headers: { "content-type": "application/json", ...conToken(token) },
+    body: JSON.stringify({ alias: "Cuenta" }),
+  });
+
+  const form = new FormData();
+  form.append("photo", new File([png(16) as unknown as BlobPart], "foto.png", { type: "image/png" }));
+  const res = await app.request("/api/profile/photos", {
+    method: "POST",
+    headers: conToken(token),
+    body: form,
+  });
+  assertEquals(res.status, 201);
+});
+
+Deno.test("Una foto se sirve aunque la petición traiga cookie de cuenta", async () => {
+  await limpiarFotos();
+  await limpiarCuentas();
+  const alta = await registrar(correo(), "contraseña-larga");
+  const token = await tokenDe(alta);
+  await app.request("/api/profile", {
+    method: "PUT",
+    headers: { "content-type": "application/json", ...conToken(token) },
+    body: JSON.stringify({ alias: "Cuenta" }),
+  });
+
+  const form = new FormData();
+  form.append("photo", new File([png(16) as unknown as BlobPart], "foto.png", { type: "image/png" }));
+  const { data } = await (await app.request("/api/profile/photos", { method: "POST", headers: conToken(token), body: form })).json();
+
+  const cookie = cookieDe(alta);
+  const foto = await app.request(`/api/photos/${data.id}`, { headers: { cookie } });
+  assertEquals(foto.status, 200);
+});
+
+Deno.test("Más de diez subidas al día responden 429", async () => {
+  await limpiarFotos();
+  const cookie = await crearVisita("Ana");
+
+  // El tope de 6 fotos puede devolver 409; lo que se prueba aquí es el límite diario.
+  for (let i = 0; i < 10; i++) {
+    const res = await subirFoto(jpeg(), "image/jpeg", cookie);
+    assertEquals([201, 409].includes(res.status), true);
+  }
+  assertEquals((await subirFoto(jpeg(), "image/jpeg", cookie)).status, 429);
+});
+
+Deno.test("Ids de foto inválidos responden 404, nunca 500", async () => {
+  await limpiarFotos();
+
+  assertEquals((await app.request("/api/photos/1")).status, 404);
+  assertEquals((await app.request("/api/photos/no-es-uuid")).status, 404);
+  assertEquals((await app.request("/api/photos/00000000-0000-0000-0000-000000000000")).status, 404);
 });
