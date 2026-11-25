@@ -3,7 +3,7 @@ import type { Context } from "@hono/hono";
 import { logger } from "@hono/hono/logger";
 import { bodyLimit } from "@hono/hono/body-limit";
 import { HTTPException } from "@hono/hono/http-exception";
-import { and, count, desc, eq, gt, gte, isNull, lt, lte, ne, notExists, or, sql } from "drizzle-orm";
+import { and, count, desc, eq, gt, gte, inArray, isNull, lt, lte, ne, notExists, or, sql } from "drizzle-orm";
 import type { SQLWrapper } from "drizzle-orm";
 import {
   crearDigestDeTokens,
@@ -19,13 +19,19 @@ import {
   blocks,
   bottleViews,
   bottles,
+  conversations,
+  groupMembers,
+  groupMessages,
   messages,
+  planAttendees,
+  plans,
   notifications,
   photos,
   profiles,
   reports,
   reservations,
   sessions,
+  swipes,
   type Bottle,
 } from "./db/schema.ts";
 
@@ -275,8 +281,14 @@ const afinidadEntre = async (a: string, b: string): Promise<number | null> => {
 
 type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
 
-const notificar = async (tx: Tx, visitor: string, type: string, bottleId: number | null) => {
-  await tx.insert(notifications).values({ visitorId: visitor, type, bottleId });
+const notificar = async (
+  tx: Tx,
+  visitor: string,
+  type: string,
+  bottleId: number | null,
+  conversationId: number | null = null,
+) => {
+  await tx.insert(notifications).values({ visitorId: visitor, type, bottleId, conversationId });
   await tx.execute(sql`
     delete from notifications
     where visitor_id = ${visitor}
@@ -1109,6 +1121,57 @@ const mensajePublico = (
   createdAt: m.createdAt,
 });
 
+const leerBefore = (raw: string | undefined): number | undefined | "invalido" => {
+  if (raw === undefined) return undefined;
+  const numero = Number(raw);
+  if (!/^\d+$/.test(raw) || numero <= 0 || numero > ID_MAX) return "invalido";
+  return numero;
+};
+
+const mensajesDe = async (conversationId: number, visitor: string, before?: number) => {
+  const condiciones = [eq(messages.conversationId, conversationId)];
+  if (before !== undefined) condiciones.push(lt(messages.id, before));
+
+  const filas = await db
+    .select({
+      id: messages.id,
+      text: messages.text,
+      senderVisitor: messages.senderVisitor,
+      senderAlias: messages.senderAlias,
+      createdAt: messages.createdAt,
+      senderPublicId: profiles.publicId,
+    })
+    .from(messages)
+    .leftJoin(profiles, eq(profiles.visitorId, messages.senderVisitor))
+    .where(and(...condiciones))
+    .orderBy(desc(messages.id))
+    .limit(50);
+
+  return filas
+    .reverse()
+    .map((m) => mensajePublico(m, m.senderVisitor === visitor, m.senderPublicId));
+};
+
+const conversacionDePareja = (a: string, b: string) =>
+  and(
+    isNull(conversations.bottleId),
+    or(
+      and(eq(conversations.visitorA, a), eq(conversations.visitorB, b)),
+      and(eq(conversations.visitorA, b), eq(conversations.visitorB, a)),
+    ),
+  );
+
+const validarTextoMensaje = (body: Record<string, unknown>) => {
+  if (typeof body.text !== "string") return { error: "el mensaje es obligatorio" };
+  const text = body.text.trim();
+  if (tieneInvisibles(text)) return { error: "el mensaje contiene caracteres no permitidos" };
+  const largo = [...text].length;
+  if (largo < 1 || largo > 500) {
+    return { error: "el mensaje debe tener entre 1 y 500 caracteres" };
+  }
+  return { text };
+};
+
 app.post("/api/bottles/:id/messages", async (c) => {
   const id = idValido(c.req.param("id"));
   if (id === null) return c.json({ error: "botella no encontrada" }, 404);
@@ -1116,18 +1179,9 @@ app.post("/api/bottles/:id/messages", async (c) => {
   const body = await leerCuerpo(c);
   if (!body) return c.json({ error: "cuerpo inválido" }, 400);
 
-  if (typeof body.text !== "string") {
-    return c.json({ error: "el mensaje es obligatorio" }, 422);
-  }
-
-  const text = body.text.trim();
-  if (tieneInvisibles(text)) {
-    return c.json({ error: "el mensaje contiene caracteres no permitidos" }, 422);
-  }
-  const largo = [...text].length;
-  if (largo < 1 || largo > 500) {
-    return c.json({ error: "el mensaje debe tener entre 1 y 500 caracteres" }, 422);
-  }
+  const validado = validarTextoMensaje(body);
+  if ("error" in validado) return c.json({ error: validado.error }, 422);
+  const text = validado.text;
 
   const visitor = c.get("visitor");
   if (!visitor) return c.json({ error: "no participas en esa conversación" }, 403);
@@ -1139,9 +1193,9 @@ app.post("/api/bottles/:id/messages", async (c) => {
     estado: "ok" as "ok" | "no-existe" | "ajena" | "solo-lectora" | "expirada" | "bloqueada",
   };
   let creado: { id: number; text: string; senderAlias: string; createdAt: Date } | undefined;
+  let conversacionId: number | undefined;
 
   await db.transaction(async (tx) => {
-    // Bloquea la botella: evita que la destruyan justo mientras se confirma la conversación.
     const [bottle] = await tx
       .select()
       .from(bottles)
@@ -1167,18 +1221,16 @@ app.post("/api/bottles/:id/messages", async (c) => {
       return;
     }
 
-    if (esAutora || esLectora) {
-      const otra = esAutora ? reserva?.visitorId : bottle.authorVisitor;
-      if (otra) {
-        const [bloqueo] = await tx
-          .select()
-          .from(blocks)
-          .where(bloqueoEntre(visitor, otra))
-          .limit(1);
-        if (bloqueo) {
-          salida.estado = "bloqueada";
-          return;
-        }
+    const otra = esAutora ? reserva?.visitorId : bottle.authorVisitor;
+    if (otra) {
+      const [bloqueo] = await tx
+        .select()
+        .from(blocks)
+        .where(bloqueoEntre(visitor, otra))
+        .limit(1);
+      if (bloqueo) {
+        salida.estado = "bloqueada";
+        return;
       }
     }
 
@@ -1199,7 +1251,6 @@ app.post("/api/bottles/:id/messages", async (c) => {
         .returning();
 
       if (!confirmada) {
-        // Otra petición idéntica la confirmó a la vez: seguir y escribir el mensaje.
         const [actual] = await tx
           .select()
           .from(reservations)
@@ -1212,15 +1263,44 @@ app.post("/api/bottles/:id/messages", async (c) => {
       }
     }
 
+    // La conversación de botella nace al confirmar; si otra petición la creó, se reutiliza.
+    let [conversacion] = await tx
+      .select()
+      .from(conversations)
+      .where(eq(conversations.bottleId, id))
+      .limit(1);
+
+    if (!conversacion) {
+      await tx
+        .insert(conversations)
+        .values({
+          bottleId: id,
+          visitorA: bottle.authorVisitor,
+          visitorB: reserva?.visitorId ?? visitor,
+        })
+        .onConflictDoNothing();
+      [conversacion] = await tx
+        .select()
+        .from(conversations)
+        .where(eq(conversations.bottleId, id))
+        .limit(1);
+    }
+
+    conversacionId = conversacion.id;
+
     const [msg] = await tx
       .insert(messages)
-      .values({ bottleId: id, senderVisitor: visitor, senderAlias: perfil.alias, text })
+      .values({
+        conversationId: conversacion.id,
+        senderVisitor: visitor,
+        senderAlias: perfil.alias,
+        text,
+      })
       .returning();
     creado = msg;
 
-    const destinatario = esAutora ? reserva?.visitorId : bottle.authorVisitor;
-    if (destinatario && destinatario !== visitor) {
-      await notificar(tx, destinatario, "mensaje_nuevo", id);
+    if (otra && otra !== visitor) {
+      await notificar(tx, otra, "mensaje_nuevo", id, conversacion.id);
     }
   });
 
@@ -1234,7 +1314,7 @@ app.post("/api/bottles/:id/messages", async (c) => {
   }
   if (salida.estado === "expirada") return c.json({ error: "la reserva ha expirado" }, 409);
 
-  return c.json({ data: mensajePublico(creado!, true, perfil.publicId) }, 201);
+  return c.json({ data: { ...mensajePublico(creado!, true, perfil.publicId), conversationId: conversacionId } }, 201);
 });
 
 app.get("/api/bottles/:id/messages", async (c) => {
@@ -1271,38 +1351,96 @@ app.get("/api/bottles/:id/messages", async (c) => {
     return c.json({ error: "no puedes interactuar con esa persona" }, 403);
   }
 
-  const raw = c.req.query("before");
-  let before: number | undefined;
-  if (raw !== undefined) {
-    const numero = Number(raw);
-    if (!/^\d+$/.test(raw) || numero <= 0 || numero > ID_MAX) {
-      return c.json({ error: "before debe ser un id positivo" }, 422);
-    }
-    before = Number(raw);
+  const before = leerBefore(c.req.query("before"));
+  if (before === "invalido") return c.json({ error: "before debe ser un id positivo" }, 422);
+
+  const [conversacion] = await db
+    .select()
+    .from(conversations)
+    .where(eq(conversations.bottleId, id))
+    .limit(1);
+
+  if (!conversacion) return c.json({ data: [] });
+
+  return c.json({ data: await mensajesDe(conversacion.id, visitor, before) });
+});
+
+app.get("/api/conversations/:id/messages", async (c) => {
+  const id = idValido(c.req.param("id"));
+  if (id === null) return c.json({ error: "conversación no encontrada" }, 404);
+
+  const [conversacion] = await db
+    .select()
+    .from(conversations)
+    .where(and(eq(conversations.id, id), isNull(conversations.bottleId)))
+    .limit(1);
+  if (!conversacion) return c.json({ error: "conversación no encontrada" }, 404);
+
+  const visitor = c.get("visitor");
+  const esParticipante = conversacion.visitorA === visitor || conversacion.visitorB === visitor;
+  if (!visitor || !esParticipante) {
+    return c.json({ error: "no participas en esa conversación" }, 403);
   }
 
-  const condiciones = [eq(messages.bottleId, id)];
-  if (before !== undefined) condiciones.push(lt(messages.id, before));
+  const otra = conversacion.visitorA === visitor ? conversacion.visitorB : conversacion.visitorA;
+  if (await estanBloqueados(visitor, otra)) {
+    return c.json({ error: "no puedes interactuar con esa persona" }, 403);
+  }
 
-  const filas = await db
-    .select({
-      id: messages.id,
-      text: messages.text,
-      senderVisitor: messages.senderVisitor,
-      senderAlias: messages.senderAlias,
-      createdAt: messages.createdAt,
-      senderPublicId: profiles.publicId,
-    })
-    .from(messages)
-    .leftJoin(profiles, eq(profiles.visitorId, messages.senderVisitor))
-    .where(and(...condiciones))
-    .orderBy(desc(messages.id))
-    .limit(50);
+  const before = leerBefore(c.req.query("before"));
+  if (before === "invalido") return c.json({ error: "before debe ser un id positivo" }, 422);
 
-  const data = filas
-    .reverse()
-    .map((m) => mensajePublico(m, m.senderVisitor === visitor, m.senderPublicId));
-  return c.json({ data });
+  return c.json({ data: await mensajesDe(conversacion.id, visitor, before) });
+});
+
+app.post("/api/conversations/:id/messages", async (c) => {
+  const id = idValido(c.req.param("id"));
+  if (id === null) return c.json({ error: "conversación no encontrada" }, 404);
+
+  const body = await leerCuerpo(c);
+  if (!body) return c.json({ error: "cuerpo inválido" }, 400);
+
+  const validado = validarTextoMensaje(body);
+  if ("error" in validado) return c.json({ error: validado.error }, 422);
+  const text = validado.text;
+
+  const [conversacion] = await db
+    .select()
+    .from(conversations)
+    .where(and(eq(conversations.id, id), isNull(conversations.bottleId)))
+    .limit(1);
+  if (!conversacion) return c.json({ error: "conversación no encontrada" }, 404);
+
+  const visitor = c.get("visitor");
+  const esParticipante = conversacion.visitorA === visitor || conversacion.visitorB === visitor;
+  if (!visitor || !esParticipante) {
+    return c.json({ error: "no participas en esa conversación" }, 403);
+  }
+
+  const perfil = await perfilDe(visitor);
+  if (!perfil) return c.json({ error: "necesitas un alias para escribir" }, 403);
+
+  const otra = conversacion.visitorA === visitor ? conversacion.visitorB : conversacion.visitorA;
+  if (await estanBloqueados(visitor, otra)) {
+    return c.json({ error: "no puedes interactuar con esa persona" }, 403);
+  }
+
+  let creado: { id: number; text: string; senderAlias: string; createdAt: Date } | undefined;
+  await db.transaction(async (tx) => {
+    const [msg] = await tx
+      .insert(messages)
+      .values({
+        conversationId: conversacion.id,
+        senderVisitor: visitor,
+        senderAlias: perfil.alias,
+        text,
+      })
+      .returning();
+    creado = msg;
+    await notificar(tx, otra, "mensaje_nuevo", null, conversacion.id);
+  });
+
+  return c.json({ data: { ...mensajePublico(creado!, true, perfil.publicId), conversationId: conversacion.id } }, 201);
 });
 
 // --------------------------------------------------------------------- fotos
@@ -1490,6 +1628,11 @@ app.post("/api/blocks", async (c) => {
         ),
       ));
 
+    await tx.delete(swipes).where(or(
+      and(eq(swipes.visitorId, visitor), eq(swipes.targetVisitor, objetivo.visitorId)),
+      and(eq(swipes.visitorId, objetivo.visitorId), eq(swipes.targetVisitor, visitor)),
+    ));
+
     for (const reserva of entreLaPareja) {
       await tx
         .delete(reservations)
@@ -1653,17 +1796,776 @@ app.put("/api/affinity", async (c) => {
   return c.json({ data: { answers: await respuestasDe(visitor) } });
 });
 
+// ---------------------------------------------------------------- swipe / match
+app.get("/api/deck", async (c) => {
+  const visitor = c.get("visitor");
+  if (!visitor || !(await perfilDe(visitor))) {
+    return c.json({ error: "necesitas un alias" }, 403);
+  }
+
+  const comunes = sql`(
+    select count(*) from affinity_answers ma
+    join affinity_answers sa on sa.question = ma.question and sa.visitor_id = ${profiles.visitorId}
+    where ma.visitor_id = ${visitor}
+      and (ma.question, ma.option) in (${sql.raw(PARES_SQL)})
+      and (sa.question, sa.option) in (${sql.raw(PARES_SQL)})
+  )`;
+  const coincidencias = sql`(
+    select count(*) from affinity_answers ma
+    join affinity_answers sa on sa.question = ma.question and sa.visitor_id = ${profiles.visitorId}
+    where ma.visitor_id = ${visitor}
+      and ma.option = sa.option
+      and (ma.question, ma.option) in (${sql.raw(PARES_SQL)})
+      and (sa.question, sa.option) in (${sql.raw(PARES_SQL)})
+  )`;
+  const puntuacion = sql`case when ${comunes} >= 2 then round(${coincidencias} * 100.0 / ${comunes}) else 50 end`;
+
+  const yaDeslizados = db
+    .select()
+    .from(swipes)
+    .where(and(eq(swipes.visitorId, visitor), eq(swipes.targetVisitor, profiles.visitorId)));
+  const bloqueados = db
+    .select()
+    .from(blocks)
+    .where(bloqueoEntre(visitor, profiles.visitorId));
+
+  const [candidato] = await db
+    .select({
+      visitorId: profiles.visitorId,
+      publicId: profiles.publicId,
+      alias: profiles.alias,
+      bio: profiles.bio,
+    })
+    .from(profiles)
+    .where(and(
+      ne(profiles.visitorId, visitor),
+      notExists(yaDeslizados),
+      notExists(bloqueados),
+    ))
+    .orderBy(sql`${puntuacion} desc, random()`)
+    .limit(1);
+
+  if (!candidato) return c.json({ data: null });
+
+  return c.json({
+    data: {
+      publicId: candidato.publicId,
+      alias: candidato.alias,
+      bio: candidato.bio,
+      photos: await fotosDe(candidato.visitorId),
+      affinity: { percentage: await afinidadEntre(visitor, candidato.visitorId) },
+    },
+  });
+});
+
+app.post("/api/swipes", async (c) => {
+  const body = await leerCuerpo(c);
+  if (!body) return c.json({ error: "cuerpo inválido" }, 400);
+
+  const visitor = c.get("visitor");
+  if (!visitor || !(await perfilDe(visitor))) {
+    return c.json({ error: "necesitas un alias" }, 403);
+  }
+
+  const publicId = typeof body.publicId === "string" ? body.publicId : "";
+  if (!UUID.test(publicId)) return c.json({ error: "publicId inválido" }, 422);
+
+  const action = body.action;
+  if (action !== "like" && action !== "discard") {
+    return c.json({ error: "action debe ser 'like' o 'discard'" }, 422);
+  }
+
+  const objetivo = await perfilPorPublicId(publicId);
+  if (!objetivo) return c.json({ error: "persona no encontrada" }, 404);
+  if (objetivo.visitorId === visitor) {
+    return c.json({ error: "no puedes deslizarte a ti mismo" }, 422);
+  }
+  if (await estanBloqueados(visitor, objetivo.visitorId)) {
+    return c.json({ error: "no puedes interactuar con esa persona" }, 403);
+  }
+
+  const [a, b] = [visitor, objetivo.visitorId].sort();
+
+  const salida = {
+    estado: "ok" as "ok" | "repetido" | "repetido-sin-match",
+  };
+  let resultado: { match: boolean; conversationId?: number } = { match: false };
+
+  await db.transaction(async (tx) => {
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`${a}|${b}`}))`);
+
+    const [existente] = await tx
+      .select()
+      .from(swipes)
+      .where(and(eq(swipes.visitorId, visitor), eq(swipes.targetVisitor, objetivo.visitorId)))
+      .limit(1);
+
+    if (existente) {
+      if (existente.action === "like" && action === "like") {
+        const [conversacion] = await tx
+          .select()
+          .from(conversations)
+          .where(conversacionDePareja(visitor, objetivo.visitorId))
+          .limit(1);
+        if (conversacion) {
+          salida.estado = "repetido";
+          resultado = { match: true, conversationId: conversacion.id };
+          return;
+        }
+      }
+      salida.estado = "repetido-sin-match";
+      return;
+    }
+
+    await tx
+      .insert(swipes)
+      .values({ visitorId: visitor, targetVisitor: objetivo.visitorId, action });
+
+    if (action !== "like") return;
+
+    const [reciproco] = await tx
+      .select()
+      .from(swipes)
+      .where(and(
+        eq(swipes.visitorId, objetivo.visitorId),
+        eq(swipes.targetVisitor, visitor),
+        eq(swipes.action, "like"),
+      ))
+      .limit(1);
+    if (!reciproco) return;
+
+    let [conversacion] = await tx
+      .select()
+      .from(conversations)
+      .where(conversacionDePareja(visitor, objetivo.visitorId))
+      .limit(1);
+
+    if (!conversacion) {
+      [conversacion] = await tx
+        .insert(conversations)
+        .values({ visitorA: a, visitorB: b })
+        .returning();
+
+      await notificar(tx, visitor, "match_nuevo", null, conversacion.id);
+      await notificar(tx, objetivo.visitorId, "match_nuevo", null, conversacion.id);
+    }
+
+    resultado = { match: true, conversationId: conversacion.id };
+  });
+
+  if (salida.estado === "repetido") return c.json({ data: resultado }, 200);
+  if (salida.estado === "repetido-sin-match") {
+    return c.json({ error: "ya deslizaste a esa persona" }, 409);
+  }
+
+  return c.json({ data: resultado }, 201);
+});
+
+app.get("/api/matches", async (c) => {
+  const visitor = c.get("visitor");
+  if (!visitor) return c.json({ error: "inicia sesión" }, 401);
+
+  const filas = await db
+    .select()
+    .from(conversations)
+    .where(and(
+      isNull(conversations.bottleId),
+      or(eq(conversations.visitorA, visitor), eq(conversations.visitorB, visitor)),
+    ))
+    .orderBy(desc(conversations.id))
+    .limit(50);
+
+  const data = [];
+  for (const conversacion of filas) {
+    const otro = conversacion.visitorA === visitor ? conversacion.visitorB : conversacion.visitorA;
+    if (await estanBloqueados(visitor, otro)) continue;
+
+    const perfil = await perfilDe(otro);
+    if (!perfil) continue;
+
+    data.push({
+      conversationId: conversacion.id,
+      publicId: perfil.publicId,
+      alias: perfil.alias,
+      createdAt: conversacion.createdAt,
+    });
+  }
+
+  return c.json({ data });
+});
+
+// -------------------------------------------------------------------- grupos
+const GRUPOS = [
+  { id: "musica", title: "Música", description: "Discos, conciertos y descubrimientos." },
+  { id: "cine", title: "Cine", description: "Películas, series y estrenos." },
+  { id: "viajes", title: "Viajes", description: "Rutas, destinos y consejos." },
+  { id: "libros", title: "Libros", description: "Lecturas y recomendaciones." },
+  { id: "deporte", title: "Deporte", description: "Entrenar, competir y animar." },
+  { id: "cocina", title: "Cocina", description: "Recetas y sitios donde comer." },
+] as const;
+
+const GRUPOS_VALIDOS = new Set<string>(GRUPOS.map((g) => g.id));
+
+app.get("/api/groups", async (c) => {
+  const visitor = c.get("visitor");
+
+  const conteos = await db
+    .select({ groupId: groupMembers.groupId, cuantos: count() })
+    .from(groupMembers)
+    .groupBy(groupMembers.groupId);
+
+  const porGrupo = new Map(conteos.map((f) => [f.groupId, Number(f.cuantos)]));
+
+  const misGrupos = visitor
+    ? new Set(
+      (await db
+        .select({ groupId: groupMembers.groupId })
+        .from(groupMembers)
+        .where(eq(groupMembers.visitorId, visitor))).map((f) => f.groupId),
+    )
+    : new Set<string>();
+
+  return c.json({
+    data: GRUPOS.map((g) => ({
+      id: g.id,
+      title: g.title,
+      description: g.description,
+      members: porGrupo.get(g.id) ?? 0,
+      joined: misGrupos.has(g.id),
+    })),
+  });
+});
+
+app.post("/api/groups/:id/join", async (c) => {
+  const grupo = c.req.param("id");
+  if (!GRUPOS_VALIDOS.has(grupo)) return c.json({ error: "grupo no encontrado" }, 404);
+
+  const visitor = c.get("visitor");
+  if (!visitor) return c.json({ error: "inicia sesión" }, 401);
+  if (!(await perfilDe(visitor))) return c.json({ error: "necesitas un alias" }, 403);
+
+  await db
+    .insert(groupMembers)
+    .values({ groupId: grupo, visitorId: visitor })
+    .onConflictDoNothing();
+
+  return c.body(null, 204);
+});
+
+app.delete("/api/groups/:id/leave", async (c) => {
+  const grupo = c.req.param("id");
+  if (!GRUPOS_VALIDOS.has(grupo)) return c.json({ error: "grupo no encontrado" }, 404);
+
+  const visitor = c.get("visitor");
+  if (!visitor) return c.json({ error: "inicia sesión" }, 401);
+
+  await db
+    .delete(groupMembers)
+    .where(and(eq(groupMembers.groupId, grupo), eq(groupMembers.visitorId, visitor)));
+
+  return c.body(null, 204);
+});
+
+app.get("/api/groups/:id/messages", async (c) => {
+  const grupo = c.req.param("id");
+  if (!GRUPOS_VALIDOS.has(grupo)) return c.json({ error: "grupo no encontrado" }, 404);
+
+  const visitor = c.get("visitor");
+  if (!visitor) return c.json({ error: "inicia sesión" }, 401);
+
+  const [miembro] = await db
+    .select()
+    .from(groupMembers)
+    .where(and(eq(groupMembers.groupId, grupo), eq(groupMembers.visitorId, visitor)))
+    .limit(1);
+  if (!miembro) return c.json({ error: "no eres miembro de ese grupo" }, 403);
+
+  const before = leerBefore(c.req.query("before"));
+  if (before === "invalido") return c.json({ error: "before debe ser un id positivo" }, 422);
+
+  const condiciones = [eq(groupMessages.groupId, grupo)];
+  if (before !== undefined) condiciones.push(lt(groupMessages.id, before));
+
+  const bloqueados = db
+    .select()
+    .from(blocks)
+    .where(bloqueoEntre(visitor, groupMessages.senderVisitor));
+
+  const filas = await db
+    .select({
+      id: groupMessages.id,
+      text: groupMessages.text,
+      senderVisitor: groupMessages.senderVisitor,
+      senderAlias: groupMessages.senderAlias,
+      createdAt: groupMessages.createdAt,
+      senderPublicId: profiles.publicId,
+    })
+    .from(groupMessages)
+    .leftJoin(profiles, eq(profiles.visitorId, groupMessages.senderVisitor))
+    .where(and(...condiciones, notExists(bloqueados)))
+    .orderBy(desc(groupMessages.id))
+    .limit(50);
+
+  const data = filas.reverse().map((m) => ({
+    id: m.id,
+    text: m.text,
+    alias: m.senderAlias,
+    publicId: m.senderPublicId,
+    mine: m.senderVisitor === visitor,
+    createdAt: m.createdAt,
+  }));
+
+  return c.json({ data });
+});
+
+app.post("/api/groups/:id/messages", async (c) => {
+  const grupo = c.req.param("id");
+  if (!GRUPOS_VALIDOS.has(grupo)) return c.json({ error: "grupo no encontrado" }, 404);
+
+  const body = await leerCuerpo(c);
+  if (!body) return c.json({ error: "cuerpo inválido" }, 400);
+
+  const visitor = c.get("visitor");
+  if (!visitor) return c.json({ error: "inicia sesión" }, 401);
+
+  const perfil = await perfilDe(visitor);
+  if (!perfil) return c.json({ error: "necesitas un alias" }, 403);
+
+  const validado = validarTextoMensaje(body);
+  if ("error" in validado) return c.json({ error: validado.error }, 422);
+  const text = validado.text;
+
+  let creado:
+    | { id: number; text: string; senderAlias: string; createdAt: Date }
+    | undefined;
+  let esMiembro = false;
+  let estado: "ok" | "sin-membresia" = "ok";
+
+  await db.transaction(async (tx) => {
+    const [miembro] = await tx
+      .select()
+      .from(groupMembers)
+      .where(and(eq(groupMembers.groupId, grupo), eq(groupMembers.visitorId, visitor)))
+      .limit(1)
+      .for("update");
+
+    if (!miembro) {
+      estado = "sin-membresia";
+      return;
+    }
+    esMiembro = true;
+
+    const [msg] = await tx
+      .insert(groupMessages)
+      .values({
+        groupId: grupo,
+        senderVisitor: visitor,
+        senderAlias: perfil.alias,
+        text,
+      })
+      .returning();
+    creado = msg;
+  });
+
+  if (!esMiembro) return c.json({ error: "no eres miembro de ese grupo" }, 403);
+
+  if (estado !== "ok" || !creado) {
+    return c.json({ error: "no eres miembro de ese grupo" }, 403);
+  }
+
+  return c.json({
+    data: {
+      id: creado.id,
+      text: creado.text,
+      alias: creado.senderAlias,
+      publicId: perfil.publicId,
+      mine: true,
+      createdAt: creado.createdAt,
+    },
+  }, 201);
+});
+
+// --------------------------------------------------------------------- planes
+const distanciaKmSql = (lat: number, lng: number) => sql`
+  2 * 6371 * asin(sqrt(least(1, greatest(0,
+    power(sin(radians(${plans.lat} - ${lat}) / 2), 2) +
+    cos(radians(${lat})) * cos(radians(${plans.lat})) *
+    power(sin(radians(${plans.lng} - ${lng}) / 2), 2)
+  ))))
+`;
+
+const numeroDeQuery = (raw: string | undefined) => {
+  if (raw === undefined) return undefined;
+  if (!/^-?\d+(\.\d+)?$/.test(raw)) return null;
+  const numero = Number(raw);
+  return Number.isFinite(numero) ? numero : null;
+};
+
+const fechaFutura = (valor: unknown) => {
+  if (typeof valor !== "string") return null;
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(valor)) return null;
+  if (!/(Z|[+-]\d{2}:\d{2})$/.test(valor)) return null;
+  const fecha = new Date(valor);
+  return Number.isNaN(fecha.getTime()) ? null : fecha;
+};
+
+const conteosDePlanes = async (ids: number[]) => {
+  if (ids.length === 0) return new Map<number, number>();
+  const filas = await db
+    .select({ planId: planAttendees.planId, cuantos: count() })
+    .from(planAttendees)
+    .where(and(inArray(planAttendees.planId, ids), eq(planAttendees.status, "confirmado")))
+    .groupBy(planAttendees.planId);
+  return new Map(filas.map((f) => [f.planId, Number(f.cuantos)]));
+};
+
+const misEstadosDePlanes = async (visitor: string | null, ids: number[]) => {
+  if (!visitor || ids.length === 0) return new Map<number, string>();
+  const filas = await db
+    .select({ planId: planAttendees.planId, status: planAttendees.status })
+    .from(planAttendees)
+    .where(and(eq(planAttendees.visitorId, visitor), inArray(planAttendees.planId, ids)));
+  return new Map(filas.map((f) => [f.planId, f.status]));
+};
+
+app.post("/api/plans", async (c) => {
+  const body = await leerCuerpo(c);
+  if (!body) return c.json({ error: "cuerpo inválido" }, 400);
+
+  const visitor = c.get("visitor");
+  if (!visitor) return c.json({ error: "inicia sesión" }, 401);
+  if (!(await perfilDe(visitor))) return c.json({ error: "necesitas un alias" }, 403);
+
+  const title = typeof body.title === "string" ? body.title.trim() : "";
+  const description = body.description === undefined || body.description === null
+    ? null
+    : typeof body.description === "string" ? body.description.trim() : undefined;
+  const place = typeof body.place === "string" ? body.place.trim() : "";
+  const lat = typeof body.lat === "number" && Number.isFinite(body.lat) ? body.lat : null;
+  const lng = typeof body.lng === "number" && Number.isFinite(body.lng) ? body.lng : null;
+  const capacity = typeof body.capacity === "number" && Number.isInteger(body.capacity)
+    ? body.capacity
+    : null;
+  const startsAt = fechaFutura(body.startsAt);
+
+  const tituloLargo = largoTexto(title);
+  if (tituloLargo < 3 || tituloLargo > 80 || tieneControles(title)) {
+    return c.json({ error: "el título debe tener entre 3 y 80 caracteres" }, 422);
+  }
+  if (description !== null && (description === undefined || largoTexto(description) > 500 || tieneControles(description))) {
+    return c.json({ error: "la descripción no puede pasar de 500 caracteres" }, 422);
+  }
+  const lugarLargo = largoTexto(place);
+  if (lugarLargo < 3 || lugarLargo > 100 || tieneControles(place)) {
+    return c.json({ error: "el sitio debe tener entre 3 y 100 caracteres" }, 422);
+  }
+  if (lat === null || lng === null || Math.abs(lat) > 90 || Math.abs(lng) > 180) {
+    return c.json({ error: "coordenadas inválidas" }, 422);
+  }
+  if (capacity === null || capacity < 1 || capacity > 50) {
+    return c.json({ error: "el aforo debe estar entre 1 y 50" }, 422);
+  }
+  if (!startsAt || startsAt.getTime() <= Date.now()) {
+    return c.json({ error: "la fecha debe ser futura y con zona horaria" }, 422);
+  }
+
+  const [plan] = await db
+    .insert(plans)
+    .values({
+      creatorVisitor: visitor,
+      title,
+      description,
+      place,
+      lat,
+      lng,
+      startsAt,
+      capacity,
+    })
+    .returning();
+
+  return c.json({ data: { id: plan.id } }, 201);
+});
+
+app.get("/api/plans", async (c) => {
+  const visitor = c.get("visitor");
+  const lat = numeroDeQuery(c.req.query("lat"));
+  const lng = numeroDeQuery(c.req.query("lng"));
+  const radioQuery = numeroDeQuery(c.req.query("radius"));
+
+  if (lat === null || lng === null || radioQuery === null) {
+    return c.json({ error: "coordenadas o radio inválidos" }, 422);
+  }
+  if ((lat === undefined) !== (lng === undefined)) {
+    return c.json({ error: "manda lat y lng juntos" }, 422);
+  }
+  if (radioQuery !== undefined && lat === undefined) {
+    return c.json({ error: "el radio necesita lat y lng" }, 422);
+  }
+  if (lat !== undefined && (Math.abs(lat) > 90 || Math.abs(lng!) > 180)) {
+    return c.json({ error: "coordenadas inválidas" }, 422);
+  }
+  const radio = radioQuery ?? 25;
+  if (!(radio > 0) || radio > 200) {
+    return c.json({ error: "el radio debe estar entre 0 y 200 km" }, 422);
+  }
+
+  const condiciones = [gt(plans.startsAt, sql`now()`)];
+  if (visitor) {
+    condiciones.push(notExists(
+      db.select().from(blocks).where(bloqueoEntre(visitor, plans.creatorVisitor)),
+    ));
+  }
+
+  const campos = {
+    id: plans.id,
+    title: plans.title,
+    description: plans.description,
+    place: plans.place,
+    startsAt: plans.startsAt,
+    capacity: plans.capacity,
+    creatorVisitor: plans.creatorVisitor,
+  };
+
+  let filas: (typeof campos extends never ? never : Record<string, unknown>)[];
+  if (lat !== undefined && lng !== undefined) {
+    const distancia = distanciaKmSql(lat, lng);
+    filas = await db
+      .select({ ...campos, distanceKm: distancia })
+      .from(plans)
+      .where(and(...condiciones, sql`${distancia} <= ${radio}`))
+      .orderBy(distancia, plans.startsAt)
+      .limit(50);
+  } else {
+    filas = await db
+      .select({ ...campos, distanceKm: sql<number | null>`null` })
+      .from(plans)
+      .where(and(...condiciones))
+      .orderBy(plans.startsAt)
+      .limit(50);
+  }
+
+  const ids = filas.map((f) => f.id as number);
+  const confirmados = await conteosDePlanes(ids);
+  const mios = await misEstadosDePlanes(visitor, ids);
+
+  return c.json({
+    data: filas.map((f) => {
+      const confirmed = confirmados.get(f.id as number) ?? 0;
+      const capacity = f.capacity as number;
+      return {
+        id: f.id,
+        title: f.title,
+        description: f.description,
+        place: f.place,
+        startsAt: f.startsAt,
+        distanceKm: f.distanceKm === null ? null : Number(f.distanceKm),
+        capacity,
+        confirmed,
+        spotsLeft: Math.max(0, capacity - confirmed),
+        isCreator: f.creatorVisitor === visitor,
+        myStatus: mios.get(f.id as number) ?? null,
+      };
+    }),
+  });
+});
+
+app.get("/api/plans/:id", async (c) => {
+  const id = idValido(c.req.param("id"));
+  if (id === null) return c.json({ error: "plan no encontrado" }, 404);
+
+  const [plan] = await db.select().from(plans).where(eq(plans.id, id)).limit(1);
+  if (!plan) return c.json({ error: "plan no encontrado" }, 404);
+
+  const visitor = c.get("visitor");
+  if (visitor && await estanBloqueados(visitor, plan.creatorVisitor)) {
+    return c.json({ error: "plan no encontrado" }, 404);
+  }
+
+  const [confirmados] = await db
+    .select({ cuantos: count() })
+    .from(planAttendees)
+    .where(and(eq(planAttendees.planId, id), eq(planAttendees.status, "confirmado")));
+
+  const creator = await perfilDe(plan.creatorVisitor);
+  const [mio] = visitor
+    ? await db
+      .select()
+      .from(planAttendees)
+      .where(and(eq(planAttendees.planId, id), eq(planAttendees.visitorId, visitor)))
+      .limit(1)
+    : [];
+
+  return c.json({
+    data: {
+      id: plan.id,
+      title: plan.title,
+      description: plan.description,
+      place: plan.place,
+      startsAt: plan.startsAt,
+      capacity: plan.capacity,
+      confirmed: Number(confirmados.cuantos),
+      spotsLeft: Math.max(0, plan.capacity - Number(confirmados.cuantos)),
+      isCreator: plan.creatorVisitor === visitor,
+      myStatus: mio?.status ?? null,
+      creator: creator ? { alias: creator.alias, publicId: creator.publicId } : null,
+    },
+  });
+});
+
+app.post("/api/plans/:id/join", async (c) => {
+  const id = idValido(c.req.param("id"));
+  if (id === null) return c.json({ error: "plan no encontrado" }, 404);
+
+  const visitor = c.get("visitor");
+  if (!visitor) return c.json({ error: "inicia sesión" }, 401);
+  if (!(await perfilDe(visitor))) return c.json({ error: "necesitas un alias" }, 403);
+
+  const [plan] = await db.select().from(plans).where(eq(plans.id, id)).limit(1);
+  if (!plan) return c.json({ error: "plan no encontrado" }, 404);
+  if (await estanBloqueados(visitor, plan.creatorVisitor)) {
+    return c.json({ error: "no puedes interactuar con esa persona" }, 403);
+  }
+
+  let estado = "confirmado";
+  const salida = { valor: "ok" as "ok" | "pasado" | "no-existe" };
+
+  await db.transaction(async (tx) => {
+    const [vivo] = await tx
+      .select()
+      .from(plans)
+      .where(eq(plans.id, id))
+      .limit(1)
+      .for("update");
+    if (!vivo) {
+      salida.valor = "no-existe";
+      return;
+    }
+    if (vivo.startsAt.getTime() <= Date.now()) {
+      salida.valor = "pasado";
+      return;
+    }
+
+    const [existente] = await tx
+      .select()
+      .from(planAttendees)
+      .where(and(eq(planAttendees.planId, id), eq(planAttendees.visitorId, visitor)))
+      .limit(1);
+    if (existente) {
+      estado = existente.status;
+      return;
+    }
+
+    const [confirmados] = await tx
+      .select({ cuantos: count() })
+      .from(planAttendees)
+      .where(and(eq(planAttendees.planId, id), eq(planAttendees.status, "confirmado")));
+
+    estado = Number(confirmados.cuantos) < vivo.capacity ? "confirmado" : "espera";
+    await tx.insert(planAttendees).values({ planId: id, visitorId: visitor, status: estado });
+  });
+
+  if (salida.valor === "no-existe") return c.json({ error: "plan no encontrado" }, 404);
+  if (salida.valor === "pasado") return c.json({ error: "el plan ya ha pasado" }, 409);
+
+  return c.json({ data: { status: estado } });
+});
+
+app.delete("/api/plans/:id/leave", async (c) => {
+  const id = idValido(c.req.param("id"));
+  if (id === null) return c.json({ error: "plan no encontrado" }, 404);
+
+  const visitor = c.get("visitor");
+  if (!visitor) return c.json({ error: "inicia sesión" }, 401);
+
+  const [plan] = await db.select().from(plans).where(eq(plans.id, id)).limit(1);
+  if (!plan) return c.json({ error: "plan no encontrado" }, 404);
+
+  await db.transaction(async (tx) => {
+    const [vivo] = await tx
+      .select()
+      .from(plans)
+      .where(eq(plans.id, id))
+      .limit(1)
+      .for("update");
+    if (!vivo) return;
+
+    const [fuera] = await tx
+      .delete(planAttendees)
+      .where(and(eq(planAttendees.planId, id), eq(planAttendees.visitorId, visitor)))
+      .returning();
+    if (!fuera || fuera.status !== "confirmado") return;
+
+    const espera = await tx
+      .select()
+      .from(planAttendees)
+      .where(and(eq(planAttendees.planId, id), eq(planAttendees.status, "espera")))
+      .orderBy(planAttendees.id);
+
+    for (const candidato of espera) {
+      const [bloqueo] = await tx
+        .select()
+        .from(blocks)
+        .where(bloqueoEntre(vivo.creatorVisitor, candidato.visitorId))
+        .limit(1);
+      if (bloqueo) continue;
+      await tx
+        .update(planAttendees)
+        .set({ status: "confirmado" })
+        .where(eq(planAttendees.id, candidato.id));
+      break;
+    }
+  });
+
+  return c.body(null, 204);
+});
+
+app.get("/api/plans/:id/attendees", async (c) => {
+  const id = idValido(c.req.param("id"));
+  if (id === null) return c.json({ error: "plan no encontrado" }, 404);
+
+  const visitor = c.get("visitor");
+  if (!visitor) return c.json({ error: "inicia sesión" }, 401);
+
+  const [plan] = await db.select().from(plans).where(eq(plans.id, id)).limit(1);
+  if (!plan) return c.json({ error: "plan no encontrado" }, 404);
+  if (plan.creatorVisitor !== visitor) {
+    return c.json({ error: "solo el creador ve los asistentes" }, 403);
+  }
+
+  const filas = await db
+    .select({
+      publicId: profiles.publicId,
+      alias: profiles.alias,
+      status: planAttendees.status,
+      visitorId: planAttendees.visitorId,
+    })
+    .from(planAttendees)
+    .innerJoin(profiles, eq(profiles.visitorId, planAttendees.visitorId))
+    .where(eq(planAttendees.planId, id))
+    .orderBy(planAttendees.id);
+
+  const data = [];
+  for (const fila of filas) {
+    if (await estanBloqueados(visitor, fila.visitorId)) continue;
+    data.push({ publicId: fila.publicId, alias: fila.alias, status: fila.status });
+  }
+
+  return c.json({ data });
+});
+
 // -------------------------------------------------------------- notificaciones
 const publicaNotificacion = (n: {
   id: number;
   type: string;
   bottleId: number | null;
+  conversationId: number | null;
   readAt: Date | null;
   createdAt: Date;
 }) => ({
   id: n.id,
   type: n.type,
   bottleId: n.bottleId,
+  conversationId: n.conversationId,
   read: n.readAt !== null,
   createdAt: n.createdAt,
 });

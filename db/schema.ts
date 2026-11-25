@@ -1,6 +1,7 @@
 import { sql } from "drizzle-orm";
 import {
   check,
+  doublePrecision,
   index,
   integer,
   pgTable,
@@ -50,17 +51,31 @@ export const reservations = pgTable("reservations", {
   ),
 ]);
 
-export const messages = pgTable("messages", {
+export const conversations = pgTable("conversations", {
   id: serial("id").primaryKey(),
   bottleId: integer("bottle_id")
-    .notNull()
+    .unique()
     .references(() => bottles.id, { onDelete: "cascade" }),
+  visitorA: varchar("visitor_a", { length: 64 }).notNull(),
+  visitorB: varchar("visitor_b", { length: 64 }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [
+  check("conversations_distintos", sql`${table.visitorA} <> ${table.visitorB}`),
+  index("conversations_a_idx").on(table.visitorA),
+  index("conversations_b_idx").on(table.visitorB),
+]);
+
+export const messages = pgTable("messages", {
+  id: serial("id").primaryKey(),
+  conversationId: integer("conversation_id")
+    .notNull()
+    .references(() => conversations.id, { onDelete: "cascade" }),
   senderVisitor: varchar("sender_visitor", { length: 64 }).notNull(),
   senderAlias: varchar("sender_alias", { length: 20 }).notNull(),
   text: varchar("text", { length: 500 }).notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 }, (table) => [
-  index("messages_bottle_idx").on(table.bottleId, table.id),
+  index("messages_conversation_idx").on(table.conversationId, table.id),
   check("messages_text_len", sql`length(${table.text}) between 1 and 500`),
 ]);
 
@@ -134,12 +149,14 @@ export const notifications = pgTable("notifications", {
   visitorId: varchar("visitor_id", { length: 64 }).notNull(),
   type: varchar("type", { length: 20 }).notNull(),
   bottleId: integer("bottle_id").references(() => bottles.id, { onDelete: "set null" }),
+  conversationId: integer("conversation_id")
+    .references(() => conversations.id, { onDelete: "set null" }),
   readAt: timestamp("read_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 }, (table) => [
   check(
     "notifications_type",
-    sql`${table.type} in ('botella_recogida','mensaje_nuevo','reserva_caducada')`,
+    sql`${table.type} in ('botella_recogida','mensaje_nuevo','reserva_caducada','match_nuevo')`,
   ),
   index("notifications_visitor_idx").on(table.visitorId, table.id),
 ]);
@@ -151,3 +168,81 @@ export const affinityAnswers = pgTable("affinity_answers", {
   question: varchar("question", { length: 20 }).notNull(),
   option: varchar("option", { length: 20 }).notNull(),
 }, (table) => [primaryKey({ columns: [table.visitorId, table.question] })]);
+
+export const swipes = pgTable("swipes", {
+  visitorId: varchar("visitor_id", { length: 64 }).notNull(),
+  targetVisitor: varchar("target_visitor", { length: 64 }).notNull(),
+  action: varchar("action", { length: 10 }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [
+  primaryKey({ columns: [table.visitorId, table.targetVisitor] }),
+  check("swipes_no_self", sql`${table.visitorId} <> ${table.targetVisitor}`),
+  check("swipes_action", sql`${table.action} in ('like','discard')`),
+  index("swipes_target_idx").on(table.targetVisitor, table.action),
+]);
+
+export const groupMembers = pgTable("group_members", {
+  groupId: varchar("group_id", { length: 20 }).notNull(),
+  visitorId: varchar("visitor_id", { length: 64 })
+    .notNull()
+    .references(() => profiles.visitorId, { onDelete: "cascade" }),
+  joinedAt: timestamp("joined_at", { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [
+  primaryKey({ columns: [table.groupId, table.visitorId] }),
+  index("group_members_visitor_idx").on(table.visitorId),
+]);
+
+export const groupMessages = pgTable("group_messages", {
+  id: serial("id").primaryKey(),
+  groupId: varchar("group_id", { length: 20 }).notNull(),
+  senderVisitor: varchar("sender_visitor", { length: 64 }).notNull(),
+  senderAlias: varchar("sender_alias", { length: 20 }).notNull(),
+  text: varchar("text", { length: 500 }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [
+  index("group_messages_group_idx").on(table.groupId, table.id),
+  check("group_messages_text_len", sql`length(${table.text}) between 1 and 500`),
+]);
+
+export const plans = pgTable("plans", {
+  id: serial("id").primaryKey(),
+  creatorVisitor: varchar("creator_visitor", { length: 64 })
+    .notNull()
+    .references(() => profiles.visitorId, { onDelete: "cascade" }),
+  title: varchar("title", { length: 80 }).notNull(),
+  description: varchar("description", { length: 500 }),
+  place: varchar("place", { length: 100 }).notNull(),
+  lat: doublePrecision("lat").notNull(),
+  lng: doublePrecision("lng").notNull(),
+  startsAt: timestamp("starts_at", { withTimezone: true }).notNull(),
+  capacity: integer("capacity").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [
+  check("plans_lat", sql`${table.lat} between -90 and 90`),
+  check("plans_lng", sql`${table.lng} between -180 and 180`),
+  check("plans_capacity", sql`${table.capacity} between 1 and 50`),
+  check("plans_title_len", sql`length(${table.title}) between 3 and 80`),
+  check(
+    "plans_description_len",
+    sql`${table.description} is null or length(${table.description}) <= 500`,
+  ),
+  check("plans_place_len", sql`length(${table.place}) between 3 and 100`),
+  index("plans_starts_idx").on(table.startsAt),
+  index("plans_coords_idx").on(table.lat, table.lng),
+]);
+
+export const planAttendees = pgTable("plan_attendees", {
+  id: serial("id").primaryKey(),
+  planId: integer("plan_id")
+    .notNull()
+    .references(() => plans.id, { onDelete: "cascade" }),
+  visitorId: varchar("visitor_id", { length: 64 })
+    .notNull()
+    .references(() => profiles.visitorId, { onDelete: "cascade" }),
+  status: varchar("status", { length: 10 }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [
+  uniqueIndex("plan_attendees_unico").on(table.planId, table.visitorId),
+  check("plan_attendees_status", sql`${table.status} in ('confirmado','espera')`),
+  index("plan_attendees_plan_idx").on(table.planId, table.status, table.id),
+]);

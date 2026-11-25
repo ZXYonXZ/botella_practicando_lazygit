@@ -34,6 +34,22 @@ deno task dev           # http://localhost:8000
 | POST   | `/api/profile/photos`       | Subir foto (multipart, campo `photo`, 5 MB, 6 máx.) |
 | DELETE | `/api/profile/photos/:id`   | Borrar una foto mía                                 |
 | GET    | `/api/photos/:id`           | Servir la foto (sin identidad, por id no adivinable)|
+| POST   | `/api/plans`                | Crear plan presencial (fecha futura, lat/lng, aforo)|
+| GET    | `/api/plans?lat&lng&radius` | Planes futuros por distancia (o por fecha)          |
+| GET    | `/api/plans/:id`            | Detalle del plan y mi estado                        |
+| POST   | `/api/plans/:id/join`       | Apuntarme (`confirmado` o `espera`)                 |
+| DELETE | `/api/plans/:id/leave`      | Salir; asciende al primero de la espera             |
+| GET    | `/api/plans/:id/attendees`  | Asistentes (solo el creador)                        |
+| GET    | `/api/groups`               | Grupos fijos, con miembros y si estoy dentro        |
+| POST   | `/api/groups/:id/join`      | Unirme a un grupo                                   |
+| DELETE | `/api/groups/:id/leave`     | Salir de un grupo                                   |
+| GET    | `/api/groups/:id/messages`  | Últimos 50 mensajes (`?before=<id>`), solo miembros |
+| POST   | `/api/groups/:id/messages`  | Escribir en el grupo (`{ "text" }`, 1–500)          |
+| GET    | `/api/deck`                 | Un perfil para deslizar (por afinidad)              |
+| POST   | `/api/swipes`               | Like o descarte (`{ publicId, action }`)            |
+| GET    | `/api/matches`              | Mis matches con su conversación                     |
+| GET    | `/api/conversations/:id/messages` | Chat de un match; `?before=<id>`              |
+| POST   | `/api/conversations/:id/messages` | Escribir en el chat de un match               |
 | GET    | `/api/notifications`        | Bandeja: `{ data, unread }`, últimas 50             |
 | POST   | `/api/notifications/:id/read` | Marcar una como leída                             |
 | POST   | `/api/notifications/read-all` | Marcar todas como leídas                          |

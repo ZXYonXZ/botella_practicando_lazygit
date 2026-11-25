@@ -2151,7 +2151,7 @@ const leerNotif = (id: number, cookie: string) =>
 const leerTodas = (cookie: string) =>
   app.request("/api/notifications/read-all", { method: "POST", headers: { cookie } });
 
-const deTipo = (data: { type: string }[], tipo: string) => data.filter((n) => n.type === tipo);
+const deTipo = (data: { type: string; [k: string]: unknown }[], tipo: string) => data.filter((n) => n.type === tipo);
 
 Deno.test("Recoger una botella notifica al autor y no al que recoge", async () => {
   await limpiarNotificaciones();
@@ -2243,7 +2243,7 @@ Deno.test("La bandeja devuelve claves exactas, orden y contador", async () => {
   assertEquals(Object.keys(cuerpo).sort(), ["data", "unread"]);
   assertEquals(typeof cuerpo.unread, "number");
   assertEquals(cuerpo.data.length >= 1, true);
-  assertEquals(Object.keys(cuerpo.data[0]).sort(), ["bottleId", "createdAt", "id", "read", "type"]);
+  assertEquals(Object.keys(cuerpo.data[0]).sort(), ["bottleId", "conversationId", "createdAt", "id", "read", "type"]);
   assertEquals(typeof cuerpo.data[0].read, "boolean");
   assertEquals(cuerpo.data[0].id > cuerpo.data[1].id, true);
 });
@@ -2551,4 +2551,764 @@ Deno.test("La afinidad solo se expone en perfil y pick", async () => {
   assertEquals(mine.data.length, 0);
   assertEquals((await (await app.request("/api/notifications", { headers: { cookie: cookieLectora } })).json()).data.every((n: object) => !("affinity" in n)), true);
   assertEquals(vista.id > 0, true);
+});
+
+// ------------------------------------------------------------------------ 12
+const mazo = (cookie: string) => app.request("/api/deck", { headers: { cookie } });
+
+const deslizar = (publicId: string, action: string, cookie: string) =>
+  app.request("/api/swipes", {
+    method: "POST",
+    headers: { "content-type": "application/json", cookie },
+    body: JSON.stringify({ publicId, action }),
+  });
+
+const misMatches = (cookie: string) => app.request("/api/matches", { headers: { cookie } });
+
+const escribirEnConversacion = (id: number, text: unknown, cookie: string) =>
+  app.request(`/api/conversations/${id}/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json", cookie },
+    body: JSON.stringify({ text }),
+  });
+
+const leerConversacion = (id: number, cookie: string, query = "") =>
+  app.request(`/api/conversations/${id}/messages${query}`, { headers: { cookie } });
+
+const limpiarSwipes = async () => {
+  await db.execute("delete from swipes");
+  await db.execute("delete from conversations where bottle_id is null");
+  await db.execute("delete from notifications where type = 'match_nuevo'");
+};
+
+Deno.test("El mazo muestra un perfil con claves exactas y sin UUID de visitante", async () => {
+  await limpiarSwipes();
+  const lectora = await visitanteCompleto("Lectora");
+  const objetivo = await visitanteCompleto("Objetivo");
+  await ponerPerfilBio("Objetivo", "Mi bio para el mazo", objetivo.cookie);
+
+  const { data } = await (await mazo(lectora.cookie)).json();
+
+  assertEquals(Object.keys(data).sort(), ["affinity", "alias", "bio", "photos", "publicId"]);
+  assertEquals(Object.keys(data.affinity), ["percentage"]);
+  assertEquals("visitorId" in data, false);
+  assertEquals(data.publicId === objetivo.publicId || data.publicId !== objetivo.visitorId, true);
+});
+
+Deno.test("El mazo exige perfil y no reparte cookie", async () => {
+  const sinPerfil = await pedirDelMar();
+  const cookieSuelta = (sinPerfil.headers.get("set-cookie") ?? "").split(";")[0];
+
+  const res = await mazo(cookieSuelta);
+
+  assertEquals(res.status, 403);
+  assertEquals(res.headers.get("set-cookie"), null);
+});
+
+Deno.test("El mazo excluye a los ya deslizados y a los bloqueados", async () => {
+  await limpiarSwipes();
+  const lectora = await visitanteCompleto("Lectora");
+  const descartado = await visitanteCompleto("Descartado");
+  const bloqueado = await visitanteCompleto("Bloqueado");
+
+  await deslizar(descartado.publicId, "discard", lectora.cookie);
+  await bloquear(bloqueado.publicId, lectora.cookie);
+
+  await db.execute(sql`
+    insert into swipes (visitor_id, target_visitor, action)
+    select ${lectora.visitorId}, visitor_id, 'discard' from profiles
+    where visitor_id not in (${lectora.visitorId}, ${descartado.visitorId}, ${bloqueado.visitorId})
+    on conflict do nothing
+  `);
+
+  const { data } = await (await mazo(lectora.cookie)).json();
+  assertEquals(data, null);
+});
+
+Deno.test("El mazo prioriza mayor afinidad", async () => {
+  await limpiarSwipes();
+  const lectora = await visitanteCompleto("Lectora");
+  const alta = await visitanteCompleto("Alta");
+  const baja = await visitanteCompleto("Baja");
+
+  await ponerAfinidad(lectora.cookie, RESPUESTAS_A);
+  await ponerAfinidad(alta.cookie, RESPUESTAS_A);
+  await ponerAfinidad(baja.cookie, RESPUESTAS_B);
+
+  // Descartar el resto del vecindario para que solo queden Alta y Baja.
+  await db.execute(sql`
+    insert into swipes (visitor_id, target_visitor, action)
+    select ${lectora.visitorId}, visitor_id, 'discard' from profiles
+    where visitor_id not in (${lectora.visitorId}, ${alta.visitorId}, ${baja.visitorId})
+    on conflict do nothing
+  `);
+
+  const { data } = await (await mazo(lectora.cookie)).json();
+  assertEquals(data.publicId, alta.publicId);
+});
+
+Deno.test("Descartar es para siempre y repetirlo responde 409", async () => {
+  await limpiarSwipes();
+  const lectora = await visitanteCompleto("Lectora");
+  const objetivo = await visitanteCompleto("Objetivo");
+
+  assertEquals((await deslizar(objetivo.publicId, "discard", lectora.cookie)).status, 201);
+  assertEquals((await deslizar(objetivo.publicId, "discard", lectora.cookie)).status, 409);
+
+  const { data } = await (await mazo(lectora.cookie)).json();
+  if (data) assertEquals(data.publicId === objetivo.publicId, false);
+});
+
+Deno.test("Un like sin reciprocidad no crea match ni conversación", async () => {
+  await limpiarSwipes();
+  const ana = await visitanteCompleto("Ana");
+  const bea = await visitanteCompleto("Bea");
+
+  const res = await deslizar(bea.publicId, "like", ana.cookie);
+  assertEquals(res.status, 201);
+  assertEquals((await res.json()).data, { match: false });
+
+  assertEquals((await (await misMatches(ana.cookie)).json()).data.length, 0);
+  const convs = await db.execute("select count(*)::int as total from conversations where bottle_id is null");
+  assertEquals(convs.rows[0], { total: 0 });
+});
+
+Deno.test("El like mutuo crea un único match, avisa a ambos y aparece en los dos", async () => {
+  await limpiarSwipes();
+  const ana = await visitanteCompleto("Ana");
+  const bea = await visitanteCompleto("Bea");
+
+  assertEquals((await (await deslizar(bea.publicId, "like", ana.cookie)).json()).data.match, false);
+  const mutuo = await deslizar(ana.publicId, "like", bea.cookie);
+  const { data } = await mutuo.json();
+
+  assertEquals(mutuo.status, 201);
+  assertEquals(data.match, true);
+  assertEquals(typeof data.conversationId, "number");
+
+  const convs = await db.execute("select count(*)::int as total from conversations where bottle_id is null");
+  assertEquals(convs.rows[0], { total: 1 });
+
+  for (const cookie of [ana.cookie, bea.cookie]) {
+    const { data: notifs } = await (await bandeja(cookie)).json();
+    assertEquals(deTipo(notifs, "match_nuevo").length, 1);
+    assertEquals(deTipo(notifs, "match_nuevo")[0].conversationId as number, data.conversationId);
+    const { data: matches } = await (await misMatches(cookie)).json();
+    assertEquals(matches.length, 1);
+  }
+});
+
+Deno.test("Likes mutuos simultáneos dejan una sola conversación", async () => {
+  await limpiarSwipes();
+  const ana = await visitanteCompleto("Ana");
+  const bea = await visitanteCompleto("Bea");
+
+  await Promise.all([
+    deslizar(bea.publicId, "like", ana.cookie),
+    deslizar(ana.publicId, "like", bea.cookie),
+  ]);
+
+  const convs = await db.execute("select count(*)::int as total from conversations where bottle_id is null");
+  assertEquals(convs.rows[0], { total: 1 });
+
+  const notifs = await db.execute("select count(*)::int as total from notifications where type = 'match_nuevo'");
+  assertEquals(notifs.rows[0], { total: 2 });
+});
+
+Deno.test("Repetir el like tras el match devuelve el mismo conversationId", async () => {
+  await limpiarSwipes();
+  const ana = await visitanteCompleto("Ana");
+  const bea = await visitanteCompleto("Bea");
+  await deslizar(bea.publicId, "like", ana.cookie);
+  const { data: primera } = await (await deslizar(ana.publicId, "like", bea.cookie)).json();
+
+  const repetida = await deslizar(ana.publicId, "like", bea.cookie);
+  assertEquals(repetida.status, 200);
+  assertEquals((await repetida.json()).data.conversationId, primera.conversationId);
+
+  const notifs = await db.execute("select count(*)::int as total from notifications where type = 'match_nuevo'");
+  assertEquals(notifs.rows[0], { total: 2 });
+});
+
+Deno.test("El chat de match funciona en ambos sentidos y un tercero no entra", async () => {
+  await limpiarSwipes();
+  const ana = await visitanteCompleto("Ana");
+  const bea = await visitanteCompleto("Bea");
+  await deslizar(bea.publicId, "like", ana.cookie);
+  const { data } = await (await deslizar(ana.publicId, "like", bea.cookie)).json();
+
+  const primero = await escribirEnConversacion(data.conversationId, "Hola Ana", bea.cookie);
+  assertEquals(primero.status, 201);
+
+  const segundo = await escribirEnConversacion(data.conversationId, "Hola Bea", ana.cookie);
+  assertEquals(segundo.status, 201);
+
+  const { data: mensajes } = await (await leerConversacion(data.conversationId, bea.cookie)).json();
+  assertEquals(mensajes.length, 2);
+  assertEquals(mensajes[0].alias, "Bea");
+  assertEquals(mensajes[0].mine, true);
+  assertEquals(mensajes[1].alias, "Ana");
+  assertEquals(typeof mensajes[0].publicId, "string");
+
+  const carla = await visitanteCompleto("Carla");
+  assertEquals((await leerConversacion(data.conversationId, carla.cookie)).status, 403);
+  assertEquals((await escribirEnConversacion(data.conversationId, "Me cuelo", carla.cookie)).status, 403);
+});
+
+Deno.test("Bloquear tras el match corta el chat y lo oculta", async () => {
+  await limpiarSwipes();
+  const ana = await visitanteCompleto("Ana");
+  const bea = await visitanteCompleto("Bea");
+  await deslizar(bea.publicId, "like", ana.cookie);
+  const { data } = await (await deslizar(ana.publicId, "like", bea.cookie)).json();
+
+  await bloquear(bea.publicId, ana.cookie);
+
+  assertEquals((await leerConversacion(data.conversationId, bea.cookie)).status, 403);
+  assertEquals((await (await misMatches(ana.cookie)).json()).data.length, 0);
+});
+
+Deno.test("Validación de mensajes en el chat de match", async () => {
+  await limpiarSwipes();
+  const ana = await visitanteCompleto("Ana");
+  const bea = await visitanteCompleto("Bea");
+  await deslizar(bea.publicId, "like", ana.cookie);
+  const { data } = await (await deslizar(ana.publicId, "like", bea.cookie)).json();
+
+  assertEquals((await escribirEnConversacion(data.conversationId, "", bea.cookie)).status, 422);
+  assertEquals((await escribirEnConversacion(data.conversationId, "a".repeat(501), bea.cookie)).status, 422);
+  assertEquals((await escribirEnConversacion(data.conversationId, "Hola\u202Emundo", bea.cookie)).status, 422);
+});
+
+Deno.test("Swipes inválidos y conversaciones ajenas o de botella", async () => {
+  await limpiarSwipes();
+  const ana = await visitanteCompleto("Ana");
+  const bea = await visitanteCompleto("Bea");
+
+  assertEquals((await deslizar(ana.publicId, "like", ana.cookie)).status, 422);
+  assertEquals((await deslizar(crypto.randomUUID(), "like", ana.cookie)).status, 404);
+  assertEquals((await deslizar(bea.publicId, "arrastra", ana.cookie)).status, 422);
+
+  assertEquals((await leerConversacion(999999, ana.cookie)).status, 404);
+  assertEquals((await leerConversacion(1, ana.cookie)).status, 404);
+});
+
+Deno.test("Una conversación de botella no se abre por /api/conversations", async () => {
+  const { cookieAutora, cookieLectora, vista } = await prepararConversacion();
+  await enviarMensaje(vista.id, "Hola desde la botella", cookieLectora);
+
+  const filas = await db.execute(
+    sql`select id from conversations where bottle_id = ${vista.id} limit 1`,
+  );
+  const conversacionId = (filas.rows[0] as { id: number }).id;
+
+  assertEquals((await leerConversacion(conversacionId, cookieAutora)).status, 404);
+});
+
+// ------------------------------------------------------------------------ 13
+const grupos = (cookie?: string) =>
+  app.request("/api/groups", { headers: cookie ? { cookie } : {} });
+
+const unirse = (grupo: string, cookie: string) =>
+  app.request(`/api/groups/${grupo}/join`, { method: "POST", headers: { cookie } });
+
+const salir = (grupo: string, cookie: string) =>
+  app.request(`/api/groups/${grupo}/leave`, { method: "DELETE", headers: { cookie } });
+
+const mensajesGrupo = (grupo: string, cookie: string, query = "") =>
+  app.request(`/api/groups/${grupo}/messages${query}`, { headers: { cookie } });
+
+const escribirGrupo = (grupo: string, text: unknown, cookie: string) =>
+  app.request(`/api/groups/${grupo}/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json", cookie },
+    body: JSON.stringify({ text }),
+  });
+
+const limpiarGrupos = async () => {
+  await db.execute("delete from group_messages");
+  await db.execute("delete from group_members");
+};
+
+Deno.test("Los grupos son fijos, listables y con contadores", async () => {
+  await limpiarGrupos();
+
+  const res = await grupos();
+  assertEquals(res.status, 200);
+  assertEquals(res.headers.get("set-cookie"), null);
+
+  const { data } = await res.json();
+  assertEquals(data.map((g: { id: string }) => g.id), [
+    "musica",
+    "cine",
+    "viajes",
+    "libros",
+    "deporte",
+    "cocina",
+  ]);
+  assertEquals(Object.keys(data[0]).sort(), ["description", "id", "joined", "members", "title"]);
+  assertEquals(data[0].members, 0);
+  assertEquals(data[0].joined, false);
+});
+
+Deno.test("La lista con cookie de cuenta responde 401", async () => {
+  await limpiarCuentas();
+  const alta = await registrar(correo(), "contraseña-larga");
+
+  assertEquals((await grupos(cookieDe(alta))).status, 401);
+});
+
+Deno.test("Unirse exige perfil y es idempotente", async () => {
+  await limpiarGrupos();
+  const cookie = await crearVisita("Ana");
+
+  const sinPerfil = await pedirDelMar();
+  const cookieSuelta = (sinPerfil.headers.get("set-cookie") ?? "").split(";")[0];
+  assertEquals((await unirse("musica", cookieSuelta)).status, 403);
+
+  assertEquals((await unirse("musica", cookie)).status, 204);
+  assertEquals((await unirse("musica", cookie)).status, 204);
+
+  const filas = await db.execute("select count(*)::int as total from group_members");
+  assertEquals(filas.rows[0], { total: 1 });
+  assertEquals((await unirse("no-existe", cookie)).status, 404);
+});
+
+Deno.test("Dos uniones simultáneas dejan una sola fila", async () => {
+  await limpiarGrupos();
+  const cookie = await crearVisita("Ana");
+
+  const [a, b] = await Promise.all([unirse("cine", cookie), unirse("cine", cookie)]);
+  assertEquals([a.status, b.status], [204, 204]);
+
+  const filas = await db.execute("select count(*)::int as total from group_members");
+  assertEquals(filas.rows[0], { total: 1 });
+});
+
+Deno.test("Salir es idempotente y no borra el historial", async () => {
+  await limpiarGrupos();
+  const ana = await crearVisita("Ana");
+
+  await unirse("viajes", ana);
+  await escribirGrupo("viajes", "Mi primer mensaje", ana);
+
+  assertEquals((await salir("viajes", ana)).status, 204);
+  assertEquals((await salir("viajes", ana)).status, 204);
+  assertEquals((await mensajesGrupo("viajes", ana)).status, 403);
+
+  await unirse("viajes", ana);
+  const { data } = await (await mensajesGrupo("viajes", ana)).json();
+  assertEquals(data.length, 1);
+  assertEquals(data[0].text, "Mi primer mensaje");
+});
+
+Deno.test("Sin membresía no se lee ni se escribe; sin identidad, 401", async () => {
+  await limpiarGrupos();
+  const cookie = await crearVisita("Ana");
+
+  assertEquals((await mensajesGrupo("libros", cookie)).status, 403);
+  assertEquals((await escribirGrupo("libros", "Hola", cookie)).status, 403);
+  assertEquals((await mensajesGrupo("libros", "")).status, 401);
+  assertEquals(
+    (await app.request("/api/groups/libros/messages", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: "Hola" }) })).status,
+    401,
+  );
+});
+
+Deno.test("Un miembro escribe y otro lee con alias, publicId y mine", async () => {
+  await limpiarGrupos();
+  const ana = await crearVisita("Ana");
+  const bea = await crearVisita("Bea");
+  await unirse("libros", ana);
+  await unirse("libros", bea);
+
+  const res = await escribirGrupo("libros", "Recomiendo este libro", ana);
+  assertEquals(res.status, 201);
+  const { data: creado } = await res.json();
+  assertEquals(Object.keys(creado).sort(), ["alias", "createdAt", "id", "mine", "publicId", "text"]);
+  assertEquals(creado.mine, true);
+
+  const { data } = await (await mensajesGrupo("libros", bea)).json();
+  assertEquals(data.length, 1);
+  assertEquals(data[0].alias, "Ana");
+  assertEquals(data[0].mine, false);
+  assertEquals(typeof data[0].publicId, "string");
+});
+
+Deno.test("Validación de mensajes de grupo", async () => {
+  await limpiarGrupos();
+  const cookie = await crearVisita("Ana");
+  await unirse("deporte", cookie);
+
+  assertEquals((await escribirGrupo("deporte", "", cookie)).status, 422);
+  assertEquals((await escribirGrupo("deporte", "a", cookie)).status, 201);
+  assertEquals((await escribirGrupo("deporte", "b".repeat(500), cookie)).status, 201);
+  assertEquals((await escribirGrupo("deporte", "c".repeat(501), cookie)).status, 422);
+  assertEquals((await escribirGrupo("deporte", "Hola\u202Emundo", cookie)).status, 422);
+  assertEquals(
+    (await app.request("/api/groups/deporte/messages", { method: "POST", headers: { "content-type": "application/json", cookie }, body: "null" })).status,
+    400,
+  );
+});
+
+Deno.test("Los mensajes de grupo se paginan de 50 en 50", async () => {
+  await limpiarGrupos();
+  const cookie = await crearVisita("Ana");
+  await unirse("cocina", cookie);
+
+  for (let i = 1; i <= 55; i++) await escribirGrupo("cocina", `Mensaje ${i}`, cookie);
+
+  const { data: ultimos } = await (await mensajesGrupo("cocina", cookie)).json();
+  assertEquals(ultimos.length, 50);
+  assertEquals(ultimos[49].text, "Mensaje 55");
+
+  const { data: anteriores } = await (
+    await mensajesGrupo("cocina", cookie, `?before=${ultimos[0].id}`)
+  ).json();
+  assertEquals(anteriores.length, 5);
+  assertEquals(anteriores[4].text, "Mensaje 5");
+
+  assertEquals((await mensajesGrupo("cocina", cookie, "?before=abc")).status, 422);
+});
+
+Deno.test("El bloqueo oculta mensajes en ambos sentidos, no al tercero", async () => {
+  await limpiarGrupos();
+  const ana = await visitanteCompleto("Ana");
+  const bea = await visitanteCompleto("Bea");
+  const carla = await visitanteCompleto("Carla");
+  for (const v of [ana, bea, carla]) await unirse("musica", v.cookie);
+
+  await escribirGrupo("musica", "Mensaje de Ana", ana.cookie);
+  await escribirGrupo("musica", "Mensaje de Bea", bea.cookie);
+  await escribirGrupo("musica", "Mensaje de Carla", carla.cookie);
+
+  await bloquear(bea.publicId, ana.cookie);
+
+  const { data: deAna } = await (await mensajesGrupo("musica", ana.cookie)).json();
+  assertEquals(deAna.map((m: { text: string }) => m.text), ["Mensaje de Ana", "Mensaje de Carla"]);
+
+  const { data: deBea } = await (await mensajesGrupo("musica", bea.cookie)).json();
+  assertEquals(deBea.map((m: { text: string }) => m.text), ["Mensaje de Bea", "Mensaje de Carla"]);
+
+  const { data: deCarla } = await (await mensajesGrupo("musica", carla.cookie)).json();
+  assertEquals(deCarla.length, 3);
+});
+
+Deno.test("Grupo inexistente responde 404 en las cuatro rutas", async () => {
+  const cookie = await crearVisita("Ana");
+
+  assertEquals((await unirse("inventado", cookie)).status, 404);
+  assertEquals((await salir("inventado", cookie)).status, 404);
+  assertEquals((await mensajesGrupo("inventado", cookie)).status, 404);
+  assertEquals((await escribirGrupo("inventado", "Hola", cookie)).status, 404);
+});
+
+Deno.test("El alias del mensaje queda congelado", async () => {
+  await limpiarGrupos();
+  const cookie = await crearVisita("Ana");
+  await unirse("cine", cookie);
+  await escribirGrupo("cine", "Mensaje con alias", cookie);
+
+  await ponerPerfil("Bego", cookie);
+
+  const { data } = await (await mensajesGrupo("cine", cookie)).json();
+  assertEquals(data[0].alias, "Ana");
+});
+
+Deno.test("Los grupos no generan notificaciones", async () => {
+  await limpiarGrupos();
+  await limpiarNotificaciones();
+  const cookie = await crearVisita("Ana");
+
+  const antes = await db.execute("select count(*)::int as total from notifications");
+  await unirse("viajes", cookie);
+  await escribirGrupo("viajes", "Hola grupo", cookie);
+  await salir("viajes", cookie);
+  const despues = await db.execute("select count(*)::int as total from notifications");
+
+  assertEquals(despues.rows[0], antes.rows[0]);
+});
+
+Deno.test("La membresía con Bearer sobrevive al login en otro dispositivo", async () => {
+  await limpiarGrupos();
+  await limpiarCuentas();
+  const email = correo();
+  const alta = await registrar(email, "contraseña-larga");
+  const token = await tokenDe(alta);
+
+  await app.request("/api/profile", {
+    method: "PUT",
+    headers: { "content-type": "application/json", ...conToken(token) },
+    body: JSON.stringify({ alias: "Cuenta" }),
+  });
+  await app.request("/api/groups/libros/join", { method: "POST", headers: conToken(token) });
+
+  const otroToken = await tokenDe(await entrar(email, "contraseña-larga"));
+  const { data } = await (await app.request("/api/groups", { headers: conToken(otroToken) })).json();
+  assertEquals(data.find((g: { id: string }) => g.id === "libros").joined, true);
+});
+
+// ------------------------------------------------------------------------ 14
+const crearPlan = (body: unknown, cookie: string) =>
+  app.request("/api/plans", {
+    method: "POST",
+    headers: { "content-type": "application/json", cookie },
+    body: JSON.stringify(body),
+  });
+
+const listarPlanes = (query = "", cookie?: string) =>
+  app.request(`/api/plans${query}`, { headers: cookie ? { cookie } : {} });
+
+const verPlan = (id: number, cookie?: string) =>
+  app.request(`/api/plans/${id}`, { headers: cookie ? { cookie } : {} });
+
+const apuntarseAPlan = (id: number, cookie: string) =>
+  app.request(`/api/plans/${id}/join`, { method: "POST", headers: { cookie } });
+
+const salirDePlan = (id: number, cookie: string) =>
+  app.request(`/api/plans/${id}/leave`, { method: "DELETE", headers: { cookie } });
+
+const asistentesDePlan = (id: number, cookie: string) =>
+  app.request(`/api/plans/${id}/attendees`, { headers: { cookie } });
+
+const limpiarPlanes = () => db.execute("delete from plans");
+
+const MADRID = { lat: 40.4168, lng: -3.7038 };
+const BARCELONA = { lat: 41.3874, lng: 2.1686 };
+
+const planValido = (extra: Record<string, unknown> = {}) => ({
+  title: "Quedada de prueba",
+  description: "Un plan cualquiera",
+  place: "Parque del Retiro",
+  lat: MADRID.lat,
+  lng: MADRID.lng,
+  startsAt: new Date(Date.now() + 86_400_000).toISOString(),
+  capacity: 2,
+  ...extra,
+});
+
+Deno.test("Crear un plan válido y verlo en el listado", async () => {
+  await limpiarPlanes();
+  const cookie = await crearVisita("Ana");
+
+  const res = await crearPlan(planValido(), cookie);
+  assertEquals(res.status, 201);
+  const { data } = await res.json();
+  assertEquals(typeof data.id, "number");
+
+  const { data: lista } = await (await listarPlanes(`?lat=${MADRID.lat}&lng=${MADRID.lng}`, cookie)).json();
+  assertEquals(lista.length, 1);
+  assertEquals(Object.keys(lista[0]).sort(), [
+    "capacity",
+    "confirmed",
+    "description",
+    "distanceKm",
+    "id",
+    "isCreator",
+    "myStatus",
+    "place",
+    "spotsLeft",
+    "startsAt",
+    "title",
+  ]);
+  assertEquals(lista[0].isCreator, true);
+  assertEquals(lista[0].spotsLeft, 2);
+});
+
+Deno.test("Validación de planes", async () => {
+  await limpiarPlanes();
+  const cookie = await crearVisita("Ana");
+
+  assertEquals((await crearPlan(planValido({ title: "ab" }), cookie)).status, 422);
+  assertEquals((await crearPlan(planValido({ lat: 91 }), cookie)).status, 422);
+  assertEquals((await crearPlan(planValido({ capacity: 0 }), cookie)).status, 422);
+  assertEquals((await crearPlan(planValido({ capacity: 51 }), cookie)).status, 422);
+  assertEquals((await crearPlan(planValido({ startsAt: "2020-01-01T10:00:00Z" }), cookie)).status, 422);
+  assertEquals((await crearPlan(planValido({ startsAt: "mañana" }), cookie)).status, 422);
+  assertEquals((await crearPlan(planValido({ title: "Hola\u202Emundo" }), cookie)).status, 422);
+
+  const sinPerfil = await app.request("/api/plans", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(planValido()),
+  });
+  assertEquals(sinPerfil.status, 401);
+});
+
+Deno.test("El listado ordena por distancia y excluye los pasados", async () => {
+  await limpiarPlanes();
+  const cookie = await crearVisita("Ana");
+
+  await crearPlan(planValido({ title: "Lejos en Barcelona", lat: BARCELONA.lat, lng: BARCELONA.lng }), cookie);
+  await crearPlan(planValido({ title: "Cerca en Madrid" }), cookie);
+  const pasado = await (await crearPlan(planValido({ title: "Ya pasó" }), cookie)).json();
+  await db.execute(sql`update plans set starts_at = now() - interval '1 day' where id = ${pasado.data.id}`);
+
+  const { data } = await (await listarPlanes(`?lat=${MADRID.lat}&lng=${MADRID.lng}&radius=200`, cookie)).json();
+  assertEquals(data.map((p: { title: string }) => p.title), ["Cerca en Madrid"]);
+});
+
+Deno.test("La distancia es coherente", async () => {
+  await limpiarPlanes();
+  const cookie = await crearVisita("Ana");
+
+  await crearPlan(planValido({ title: "Aquí mismo" }), cookie);
+  await crearPlan(planValido({ title: "Un grado al norte", lat: 41.4168, lng: -3.7038 }), cookie);
+
+  const { data } = await (await listarPlanes(`?lat=${MADRID.lat}&lng=${MADRID.lng}&radius=200`, cookie)).json();
+  assertEquals(data[0].distanceKm < 0.01, true);
+  assertEquals(Math.abs(data[1].distanceKm - 111.19) < 2, true);
+});
+
+Deno.test("Sin coordenadas se lista por fecha y sin radio", async () => {
+  await limpiarPlanes();
+  const cookie = await crearVisita("Ana");
+
+  await crearPlan(planValido({ title: "Más tarde", startsAt: new Date(Date.now() + 172_800_000).toISOString() }), cookie);
+  await crearPlan(planValido({ title: "Antes" }), cookie);
+
+  const { data } = await (await listarPlanes("", cookie)).json();
+  assertEquals(data.map((p: { title: string }) => p.title), ["Antes", "Más tarde"]);
+  assertEquals(data[0].distanceKm, null);
+  assertEquals((await listarPlanes("?lat=40", cookie)).status, 422);
+  assertEquals((await listarPlanes("?radius=10", cookie)).status, 422);
+  assertEquals((await listarPlanes("?lat=40&lng=-3&radius=500", cookie)).status, 422);
+});
+
+Deno.test("Apuntarse confirma mientras hay plazas", async () => {
+  await limpiarPlanes();
+  const ana = await crearVisita("Ana");
+  const bea = await crearVisita("Bea");
+  const { data: plan } = await (await crearPlan(planValido(), ana)).json();
+
+  const res = await apuntarseAPlan(plan.id, bea);
+  assertEquals(res.status, 200);
+  assertEquals((await res.json()).data, { status: "confirmado" });
+
+  const { data: detalle } = await (await verPlan(plan.id, bea)).json();
+  assertEquals(detalle.confirmed, 1);
+  assertEquals(detalle.spotsLeft, 1);
+  assertEquals(detalle.myStatus, "confirmado");
+  assertEquals(Object.keys(detalle.creator).sort(), ["alias", "publicId"]);
+});
+
+Deno.test("Con el aforo lleno se entra en espera", async () => {
+  await limpiarPlanes();
+  const ana = await crearVisita("Ana");
+  const bea = await crearVisita("Bea");
+  const carla = await crearVisita("Carla");
+  const { data: plan } = await (await crearPlan(planValido({ capacity: 1 }), ana)).json();
+
+  assertEquals((await (await apuntarseAPlan(plan.id, bea)).json()).data.status, "confirmado");
+  assertEquals((await (await apuntarseAPlan(plan.id, carla)).json()).data.status, "espera");
+
+  const { data: detalle } = await (await verPlan(plan.id, carla)).json();
+  assertEquals(detalle.confirmed, 1);
+  assertEquals(detalle.spotsLeft, 0);
+  assertEquals(detalle.myStatus, "espera");
+});
+
+Deno.test("Salir confirmado asciende al primero de la espera", async () => {
+  await limpiarPlanes();
+  const ana = await crearVisita("Ana");
+  const bea = await crearVisita("Bea");
+  const carla = await crearVisita("Carla");
+  const dani = await crearVisita("Dani");
+  const { data: plan } = await (await crearPlan(planValido({ capacity: 1 }), ana)).json();
+
+  await apuntarseAPlan(plan.id, bea);
+  await apuntarseAPlan(plan.id, carla);
+  await apuntarseAPlan(plan.id, dani);
+
+  assertEquals((await salirDePlan(plan.id, bea)).status, 204);
+
+  const { data: detalleCarla } = await (await verPlan(plan.id, carla)).json();
+  const { data: detalleDani } = await (await verPlan(plan.id, dani)).json();
+  assertEquals(detalleCarla.myStatus, "confirmado");
+  assertEquals(detalleDani.myStatus, "espera");
+});
+
+Deno.test("Salir de la espera no promueve a nadie", async () => {
+  await limpiarPlanes();
+  const ana = await crearVisita("Ana");
+  const bea = await crearVisita("Bea");
+  const carla = await crearVisita("Carla");
+  const { data: plan } = await (await crearPlan(planValido({ capacity: 1 }), ana)).json();
+
+  await apuntarseAPlan(plan.id, bea);
+  await apuntarseAPlan(plan.id, carla);
+  await salirDePlan(plan.id, carla);
+
+  const { data: detalle } = await (await verPlan(plan.id, bea)).json();
+  assertEquals(detalle.confirmed, 1);
+});
+
+Deno.test("Apuntarse dos veces es idempotente", async () => {
+  await limpiarPlanes();
+  const ana = await crearVisita("Ana");
+  const bea = await crearVisita("Bea");
+  const { data: plan } = await (await crearPlan(planValido({ capacity: 1 }), ana)).json();
+
+  assertEquals((await (await apuntarseAPlan(plan.id, bea)).json()).data.status, "confirmado");
+  assertEquals((await (await apuntarseAPlan(plan.id, bea)).json()).data.status, "confirmado");
+
+  const filas = await db.execute(sql`select count(*)::int as total from plan_attendees where plan_id = ${plan.id}`);
+  assertEquals(filas.rows[0], { total: 1 });
+});
+
+Deno.test("Un plan de alguien bloqueado no aparece ni admite altas", async () => {
+  await limpiarPlanes();
+  const ana = await visitanteCompleto("Ana");
+  const bea = await visitanteCompleto("Bea");
+  const { data: plan } = await (await crearPlan(planValido(), ana.cookie)).json();
+
+  await bloquear(bea.publicId, ana.cookie);
+
+  const { data } = await (await listarPlanes("", bea.cookie)).json();
+  assertEquals(data.length, 0);
+  assertEquals((await verPlan(plan.id, bea.cookie)).status, 404);
+  assertEquals((await apuntarseAPlan(plan.id, bea.cookie)).status, 403);
+});
+
+Deno.test("Planes inexistentes, ids inválidos y planes pasados", async () => {
+  await limpiarPlanes();
+  const ana = await crearVisita("Ana");
+
+  assertEquals((await verPlan(999999, ana)).status, 404);
+  assertEquals((await verPlan(0, ana)).status, 404);
+  assertEquals((await apuntarseAPlan(999999, ana)).status, 404);
+
+  const { data: plan } = await (await crearPlan(planValido(), ana)).json();
+  await db.execute(sql`update plans set starts_at = now() - interval '1 hour' where id = ${plan.id}`);
+  assertEquals((await apuntarseAPlan(plan.id, ana)).status, 409);
+});
+
+Deno.test("Solo el creador ve los asistentes", async () => {
+  await limpiarPlanes();
+  const ana = await visitanteCompleto("Ana");
+  const bea = await visitanteCompleto("Bea");
+  const { data: plan } = await (await crearPlan(planValido(), ana.cookie)).json();
+  await apuntarseAPlan(plan.id, bea.cookie);
+
+  assertEquals((await asistentesDePlan(plan.id, bea.cookie)).status, 403);
+
+  const { data } = await (await asistentesDePlan(plan.id, ana.cookie)).json();
+  assertEquals(data.length, 1);
+  assertEquals(data[0].alias, "Bea");
+  assertEquals("visitorId" in data[0], false);
+});
+
+Deno.test("Apuntarse no crea notificaciones", async () => {
+  await limpiarPlanes();
+  await limpiarNotificaciones();
+  const ana = await crearVisita("Ana");
+  const bea = await crearVisita("Bea");
+  const { data: plan } = await (await crearPlan(planValido(), ana)).json();
+
+  const antes = await db.execute("select count(*)::int as total from notifications");
+  await apuntarseAPlan(plan.id, bea);
+  await salirDePlan(plan.id, bea);
+  const despues = await db.execute("select count(*)::int as total from notifications");
+
+  assertEquals(despues.rows[0], antes.rows[0]);
 });

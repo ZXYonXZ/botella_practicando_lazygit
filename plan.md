@@ -559,3 +559,180 @@ La suite limpia `affinity_answers` donde cuenta filas. El test de claves exactas
 | 11 | Un bloqueado no aparece en el mar ni puede recoger (sin filtrar respuestas) |
 | 12 | Una respuesta con pregunta obsoleta insertada en BD se ignora al leer y al puntuar |
 | 13 | Claves exactas en perfil y `pick`; `sea`, `mine`, `discard` y `messages` no exponen afinidad |
+
+---
+
+# Plan — Historia 12 (aprobada v2: swipe y matches)
+
+## Story
+As a person, I want to see one profile at a time and like or discard it, so that I can also meet people without waiting for a bottle.
+
+## Refactor: conversaciones
+- `conversations(id serial, bottle_id nullable UNIQUE → bottles on delete cascade, visitor_a → profiles, visitor_b → profiles, created_at)` con `CHECK visitor_a <> visitor_b`.
+- `messages.conversation_id NOT NULL → conversations on delete cascade` e índice `(conversation_id, id)`. Sin datos de producción: se recrea la tabla y se documenta el reset de `data/pgdata` y `data/test-pgdata`.
+- El chat de botella mantiene sus rutas `/api/bottles/:id/messages`; resuelve su conversación y **solo la crea al confirmar la reserva**, dentro de la misma transacción. Antes del primer mensaje, quien recoge lee `[]` y no se crea nada.
+- Carrera de confirmación: `insert … on conflict (bottle_id) do nothing` + relectura, luego insertar el mensaje; todo en una transacción.
+- `GET/POST /api/conversations/:id/messages` sirve **solo conversaciones de match** (`bottle_id is null`), con `idValido` y participantes; un tercero `403`.
+
+## Swipe
+- `swipes(visitor_id, target_visitor, action ('like'|'discard'), created_at, PK(visitor,target))` con `CHECK visitor_id <> target_visitor` y `CHECK action in ('like','discard')`.
+- `GET /api/deck` → `{ data: { publicId, alias, bio, photos, affinity: { percentage } } | null }`. Excluye yo, ya deslizados y bloqueos en ambos sentidos; orden por afinidad y azar. Exige perfil: `403` sin alias y **sin repartir cookie**.
+- `POST /api/swipes` `{ publicId, action }` → `201 { data: { match, conversationId? } }`.
+  - `discard`: no vuelve nunca.
+  - `like`: si existe el like recíproco, se crea el match.
+  - Repetir un like ya casado devuelve `200 { match: true, conversationId }` (idempotente); repetir un discard o un like sin match → `409`.
+- `GET /api/matches` → `{ data: [{ conversationId, publicId, alias, createdAt }] }`, solo matches (`bottle_id is null`), sin bloqueados, máximo 50.
+
+## Match (una transacción)
+1. `pg_advisory_xact_lock` sobre el par ordenado (mismo lock que usa bloquear).
+2. Insertar el swipe; si `23505`, se trata como repetido.
+3. Releer el like recíproco; si existe y no hay conversación, crearla con un índice único canónico `(least(a,b), greatest(a,b)) where bottle_id is null`.
+4. Notificar `match_nuevo` a ambos **después** de crear la conversación, dentro de la misma transacción.
+
+## Bloqueos y privacidad
+- Bloquear borra los likes pendientes entre la pareja y oculta los matches existentes; el chat responde `403`.
+- El mazo muestra alias, bio, fotos y porcentaje de afinidad de un desconocido: **excepción deliberada** al modelo «alias solo al recoger», documentada en `AGENTS.md`. Nunca muestra `publicId` del visitante ni sus respuestas de afinidad.
+
+## Notificaciones
+- `notifications.conversation_id nullable → conversations on delete set null` y tipo `match_nuevo` en el CHECK; la respuesta de la bandeja añade `conversationId`.
+
+## Errores
+`400` cuerpo · `422` auto-swipe, acción o `publicId` malformado · `404` público inexistente · `403` sin perfil, bloqueado o conversación ajena · `409` swipe repetido sin match.
+
+## Out of scope
+- Deshacer swipe o match, listas de quién te dio like, «me gusta» pagados.
+- Mensajes con foto/audio.
+- Estabilidad del mazo entre peticiones (los empates se rebarajan).
+
+## Nota de test
+Helpers nuevos: `limpiarSwipes` y `limpiarConversaciones` (incluyen mensajes de match). Los tests que cuentan mensajes se filtran por conversación.
+
+## Lista de tests
+
+| # | Test |
+|---|---|
+| 1 | `GET /api/deck` devuelve claves exactas, sin UUID de visitante ni respuestas de afinidad |
+| 2 | Mazo vacío → `{ data: null }`; sin perfil → `403` sin `Set-Cookie` |
+| 3 | Excluye mi perfil, ya deslizados y bloqueados en ambos sentidos |
+| 4 | Prioriza mayor afinidad entre dos candidatos |
+| 5 | Descartar lo quita para siempre; repetir dislike → `409` |
+| 6 | Like sin reciprocidad no crea match ni conversación |
+| 7 | Like mutuo: una sola conversación, dos notificaciones, aparece en `/api/matches` de ambos |
+| 8 | Likes mutuos simultáneos: exactamente una conversación y dos avisos |
+| 9 | Repetir like tras match devuelve `200` con el mismo `conversationId` y no duplica avisos |
+| 10 | Chat de match en ambos sentidos con alias y `publicId`; tercero `403`; id inválido `404` |
+| 11 | Bloqueo posterior corta el chat, oculta el match y borra likes pendientes |
+| 12 | Validación de mensajes (vacío, 501, bidi) aplica al chat de match |
+| 13 | La notificación `match_nuevo` lleva `conversationId` y no identidades internas |
+| 14 | Regresión: chat de botella, `[]` antes del primer mensaje, confirmación única y reserva caducada/liberada con nueva conversación correcta |
+| 15 | Acceso por `/api/conversations/:id` a una conversación de botella → `404`; a una ajena → `403` |
+| 16 | Tras un match, `delete from bottles` y la suite siguen funcionando (FKs correctas) |
+| 17 | Retención de 50 y bandeja siguen funcionando con `match_nuevo` mezclado |
+| 18 | Los 170 tests actuales siguen verdes |
+
+---
+
+# Plan — Historia 13 (aprobada v2: grupos por intereses)
+
+## Story
+As a person, I want to talk in groups by interests, so that conversations don't depend on a single bottle.
+
+## Modelo
+- Grupos **fijos y estables en código**: `musica`, `cine`, `viajes`, `libros`, `deporte`, `cocina`. Cualquier id fuera de la lista → `404` **antes** de tocar la BD.
+- `group_members(group_id varchar(20), visitor_id varchar(64) → profiles on delete cascade, joined_at default now(), PK(group_id, visitor_id))` + índice por `visitor_id`.
+- `group_messages(id serial, group_id varchar(20), sender_visitor varchar(64), sender_alias varchar(20), text varchar(500), created_at)` con índice `(group_id, id)` y `CHECK length(text) between 1 and 500`.
+- Si un grupo desaparece del código sus filas quedan huérfanas e ignoradas (`404` en todas las rutas). Se documenta el SQL de limpieza; los ids no se reutilizan.
+
+## Rutas
+- `GET /api/groups` → `{ data: [{ id, title, description, members, joined }] }` en el orden fijo del código. Sin identidad `200` y sin repartir cookie; **con cookie de cuenta → `401`** (regla global). `members` se calcula con un único agregado.
+- `POST /api/groups/:id/join` → `204` idempotente; exige perfil (`403`). Dos uniones simultáneas dejan una fila.
+- `DELETE /api/groups/:id/leave` → `204` siempre que el grupo exista (idempotente). Salir **no borra** el historial: al volver a unirse se siguen viendo los mensajes anteriores.
+- `GET /api/groups/:id/messages?before=<id>` → `{ data }`, últimos 50 ascendentes, **solo miembros** (`403`). `before` inválido → `422`.
+- `POST /api/groups/:id/messages` → `201 { data: { id, text, alias, publicId, mine, createdAt } }`; solo miembros, 1–500 puntos de código sin invisibles.
+
+## Reglas
+- Precedencia: `400` cuerpo → `422` texto o `before` inválido → `404` grupo → `401` sin identidad → `403` sin perfil o sin membresía.
+- Comprobar membresía e insertar el mensaje va en **una transacción** con la fila de membresía bloqueada (`FOR UPDATE`), para que un `leave` concurrente no permita escribir.
+- Bloqueos: filtrado **en SQL** con `NOT EXISTS` antes del `LIMIT`, en ambos sentidos. Las filas siguen en BD; un tercero las ve. Puede haber huecos de paginación (documentado).
+- `publicId` sale de un join con `profiles`; si faltara el perfil, `null`.
+- Sin notificaciones por unirse, salir ni escribir. Sin límite de retención ni rate limit en esta historia (deuda declarada).
+
+## Out of scope
+- Crear, editar o borrar grupos; roles, expulsiones, grupos privados.
+- Notificaciones o contadores de no leídos por grupo.
+- Purga o retención de mensajes de grupo.
+
+## Nota de test
+Helper `limpiarGrupos()`: borra `group_messages` y `group_members`. Se prueba el doble sentido del bloqueo con más de 50 mensajes intercalados.
+
+## Lista de tests
+
+| # | Test |
+|---|---|
+| 1 | `GET /api/groups`: 6 grupos en orden fijo, claves exactas, `members` entero y `joined` booleano |
+| 2 | Sin cookie: `200` sin `Set-Cookie`; con cookie de cuenta: `401` |
+| 3 | Unirse sin perfil → `403`; repetir y dos uniones simultáneas → una sola fila y `204` |
+| 4 | Salir es idempotente (`204` siempre) y no borra el historial al reincorporarse |
+| 5 | Sin membresía leer y escribir → `403`; sin identidad → `401` |
+| 6 | Un miembro escribe y otro lee con alias, `publicId`, `mine` y claves exactas |
+| 7 | Validación: vacío, 1 y 500 aceptados, 501, bidi e invisibles → `422`; cuerpo nulo → `400` |
+| 8 | Paginación: 55 mensajes, 50 y `?before` con los 5 restantes; `before` inválido → `422` |
+| 9 | Bloqueo en ambos sentidos con mensajes intercalados: no se ven, el tercero sí los ve y no hay `500` |
+| 10 | Grupo inexistente → `404` en las cuatro rutas, sin `500` y sin tocar filas huérfanas |
+| 11 | Alias congelado: renombrarse no cambia mensajes antiguos; alias repetidos con `mine` correcto |
+| 12 | Ni unirse, ni salir, ni escribir crean notificaciones ni recortan las existentes |
+| 13 | Membresía con Bearer sobrevive a un login en otro dispositivo |
+| 14 | Los 184 tests actuales siguen verdes |
+
+---
+
+# Plan — Historia 14 (aprobada: planes presenciales)
+
+## Story
+As a person, I want to see nearby plans and sign up, so that I can meet people in person.
+
+## Modelo
+- `plans(id, creator_visitor, title varchar(80), description varchar(500), place_name varchar(100), lat double precision, lng double precision, starts_at, capacity int, created_at)` con `CHECK` de rangos (lat -90..90, lng -180..180, capacity 1..50, título 3–80, descripción ≤500).
+- `plan_attendees(plan_id → plans cascade, visitor_id, status ('confirmado'|'espera'), created_at, PK(plan,visitor))` con índice por plan y estado.
+- Sin geolocalización propia del usuario: el cliente manda `lat`/`lng` al listar. Si no los manda, se ordena por fecha.
+
+## Rutas
+- `POST /api/plans` `{ title, description?, place, lat, lng, startsAt, capacity }` → `201 { data: { id } }`; exige perfil.
+- `GET /api/plans?lat=&lng=&radius=<km>` → planes futuros, máximo 50: `{ id, title, place, startsAt, distanceKm, confirmed, capacity, spotsLeft, myStatus }`. `radius` por defecto 25 km, máximo 200.
+- `GET /api/plans/:id` → detalle con los mismos campos + `creator: { alias, publicId }`.
+- `POST /api/plans/:id/join` → `200 { data: { status } }` (`confirmado` o `espera`), idempotente.
+- `DELETE /api/plans/:id/leave` → `204`; si quien se va estaba confirmado, **asciende al primero de la espera**.
+
+## Reglas
+- Distancia Haversine en SQL (`6371 * acos(...)`), orden por distancia y luego por fecha.
+- Apuntarse y salir van en una transacción con `pg_advisory_xact_lock` sobre el plan: el aforo no se rebasa y la promoción de la espera es única.
+- Planes pasados (`starts_at <= now()`) no se listan ni admiten altas (`409`).
+- Bloqueos: un plan de alguien bloqueado no aparece y no se puede uno apuntar (`403`).
+- Sin notificaciones al apuntarse.
+- Errores: `400` cuerpo · `422` validación · `404` plan · `401` sin identidad · `403` sin perfil o bloqueado · `409` plan pasado.
+
+## Out of scope
+- Editar o cancelar planes, borrar asistentes, invitaciones.
+- Geolocalización del dispositivo o mapa.
+- Notificaciones de plazas o recordatorios.
+- Planes pasados en el historial.
+
+## Lista de tests
+
+| # | Test |
+|---|---|
+| 1 | Crear un plan válido y verlo en el listado |
+| 2 | Validación: título corto, fecha pasada, lat/lng fuera de rango, aforo 0 → `422`; sin perfil → `403` |
+| 3 | El listado ordena por distancia y excluye planes pasados |
+| 4 | `distanceKm` coherente (dos planes a distancias conocidas, orden correcto) |
+| 5 | Sin `lat`/`lng` se lista por fecha |
+| 6 | Apuntarse confirma mientras hay plazas; `spotsLeft` baja y `myStatus` se ve |
+| 7 | Con el aforo lleno, el siguiente queda en `espera` |
+| 8 | Salir estando confirmado asciende al primero de la espera |
+| 9 | Salir estando en espera no promueve a nadie |
+| 10 | Apuntarse dos veces es idempotente y no consume dos plazas |
+| 11 | Un plan de alguien bloqueado no aparece y apuntarse da `403` |
+| 12 | Plan inexistente o id inválido → `404`; plan pasado al apuntarse → `409` |
+| 13 | El detalle expone alias y `publicId` del creador, nunca su UUID |
+| 14 | Apuntarse no crea notificaciones |
+| 15 | Claves exactas en listado, detalle y respuestas de unirse/salir |
