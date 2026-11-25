@@ -504,3 +504,58 @@ As a person, I want to be notified when someone picks my bottle or replies, so t
 | 10 | Ids inválidos (`abc`, `0`, `1.5`, >int4) → `404`, nunca `500` |
 | 11 | Destruir una botella deja sus notificaciones con `bottleId: null` y el `GET` no falla |
 | 12 | Los mensajes bloqueados y los picks bloqueados no crean notificaciones |
+
+---
+
+# Plan — Historia 11 (aprobada v2: afinidad)
+
+## Story
+As a person, I want to answer a short affinity questionnaire shown on my profile, so that bottles reach people more like me.
+
+## Cuestionario (fijo en código, única fuente de verdad)
+6 preguntas con 3–4 opciones: `plan_ideal`, `finde`, `conversacion`, `ritmo`, `comida`, `viaje`. Cada respuesta guardada se valida contra esa lista y **se filtran** preguntas u opciones que ya no existan al leer y al puntuar.
+
+## Modelo
+- `affinity_answers(visitor_id varchar(64) → profiles on delete cascade, question varchar(20) not null, option varchar(20) not null, PK(visitor_id, question))`.
+- Afinidad **entera 0–100**: `round(coincidencias / comunes * 100)`.
+- Si hay **menos de 2 preguntas en común** → `null` (afinidad neutra, 50 al ordenar). Evita que un 1/1 dé 100%.
+- Responder es opcional y parcial; `PUT` **reemplaza**: hace upsert de lo enviado y borra las preguntas omitidas en la misma transacción. `answers: {}` vacía todo.
+
+## Rutas
+- `GET /api/affinity/questions` → `{ data: [{ id, text, options: [{ id, text }] }] }`, público, sin cookie.
+- `PUT /api/affinity` → `{ answers: { plan_ideal: "cena", … } }` → `{ data: { answers } }`. Exige identidad con perfil (`403` sin alias, sin repartir cookie). Soporta Bearer y cookie anónima.
+- `GET /api/profile` añade `affinity: { answers }`.
+- `pick` añade `authorAffinity: { percentage: number | null, answers: Record<string,string> }`; sin perfil del autor → `percentage: null`, `answers: {}`.
+
+## Mar
+- Orden con subconsulta escalar **sin GROUP BY** (compatible con `FOR UPDATE SKIP LOCKED`):
+  `coalesce((select … coincidencias …) * 100 / nullif((select … comunes …), 0), 50) DESC, random()`.
+- Si el autor o yo no tenemos respuestas (o comunes < 2) → 50, empatando con el azar.
+- Sin afinidad no cambia el resto de exclusiones (vistas, reservadas, destruidas, propias, bloqueadas).
+
+## Out of scope
+- Preguntas editables o administración.
+- Filtro duro, historial o explicación de la afinidad.
+- Muestreo top-K para evitar que botellas de afinidad baja queden relegadas (se anota como deuda).
+- Ponderar por intereses de la historia 13.
+
+## Nota de test
+La suite limpia `affinity_answers` donde cuenta filas. El test de claves exactas de `/api/profile` se actualiza con `affinity`.
+
+## Lista de tests
+
+| # | Test |
+|---|---|
+| 1 | `GET /api/affinity/questions` devuelve las 6 preguntas y opciones esperadas, sin cookie |
+| 2 | `PUT` guarda respuestas; `GET /api/profile` las muestra |
+| 3 | Pregunta u opción desconocidas, valor no textual, 21 caracteres o control → `422` |
+| 4 | Sin perfil → `403` sin `Set-Cookie`; con Bearer + alias → `200`; cookie de cuenta → `401` |
+| 5 | `PUT` reemplaza: omitir una pregunta la borra, `{}` vacía y no quedan filas duplicadas |
+| 6 | Afinidad 100% (respuestas idénticas), 0% (todas distintas) y `null` si hay menos de 2 en común |
+| 7 | Cálculo simétrico: A recogiendo de B da el mismo porcentaje que B recogiendo de A |
+| 8 | `pick` devuelve `authorAffinity` con claves exactas; sin respuestas del autor, `null` y `{}` |
+| 9 | El mar prioriza la botella de mayor afinidad cuando las puntuaciones son distintas |
+| 10 | El mar sigue funcionando sin respuestas (neutro) y no expone afinidad en la respuesta |
+| 11 | Un bloqueado no aparece en el mar ni puede recoger (sin filtrar respuestas) |
+| 12 | Una respuesta con pregunta obsoleta insertada en BD se ignora al leer y al puntuar |
+| 13 | Claves exactas en perfil y `pick`; `sea`, `mine`, `discard` y `messages` no exponen afinidad |

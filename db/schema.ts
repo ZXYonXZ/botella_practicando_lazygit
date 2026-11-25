@@ -143,3 +143,11 @@ export const notifications = pgTable("notifications", {
   ),
   index("notifications_visitor_idx").on(table.visitorId, table.id),
 ]);
+
+export const affinityAnswers = pgTable("affinity_answers", {
+  visitorId: varchar("visitor_id", { length: 64 })
+    .notNull()
+    .references(() => profiles.visitorId, { onDelete: "cascade" }),
+  question: varchar("question", { length: 20 }).notNull(),
+  option: varchar("option", { length: 20 }).notNull(),
+}, (table) => [primaryKey({ columns: [table.visitorId, table.question] })]);

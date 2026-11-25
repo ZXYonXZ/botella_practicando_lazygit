@@ -15,6 +15,7 @@ import {
 import { db } from "./db/client.ts";
 import {
   accounts,
+  affinityAnswers,
   blocks,
   bottleViews,
   bottles,
@@ -178,6 +179,98 @@ const bloqueoEntre = (a: string | SQLWrapper, b: string | SQLWrapper) =>
 const estanBloqueados = async (a: string, b: string) => {
   const [fila] = await db.select().from(blocks).where(bloqueoEntre(a, b)).limit(1);
   return fila !== undefined;
+};
+
+// ---------------------------------------------------------------- afinidad
+const PREGUNTAS = [
+  {
+    id: "plan_ideal",
+    text: "¿Cuál es tu plan ideal?",
+    options: [
+      { id: "cena", text: "Cena tranquila" },
+      { id: "cine", text: "Cine" },
+      { id: "senderismo", text: "Senderismo" },
+      { id: "concierto", text: "Concierto" },
+    ],
+  },
+  {
+    id: "finde",
+    text: "¿Tu fin de semana perfecto?",
+    options: [
+      { id: "playa", text: "Playa" },
+      { id: "montana", text: "Montaña" },
+      { id: "ciudad", text: "Ciudad" },
+      { id: "casa", text: "Casa" },
+    ],
+  },
+  {
+    id: "conversacion",
+    text: "¿Qué te engancha en una conversación?",
+    options: [
+      { id: "humor", text: "El humor" },
+      { id: "profundidad", text: "La profundidad" },
+      { id: "memes", text: "Los memes" },
+      { id: "actualidad", text: "La actualidad" },
+    ],
+  },
+  {
+    id: "ritmo",
+    text: "¿A qué ritmo vives?",
+    options: [
+      { id: "tranquilo", text: "Tranquilo" },
+      { id: "intenso", text: "Intenso" },
+      { id: "depende", text: "Depende del día" },
+    ],
+  },
+  {
+    id: "comida",
+    text: "¿Plan de comida?",
+    options: [
+      { id: "cocinar", text: "Cocinar en casa" },
+      { id: "salir", text: "Salir a comer" },
+      { id: "pedir", text: "Pedir a domicilio" },
+      { id: "igual", text: "Me da igual" },
+    ],
+  },
+  {
+    id: "viaje",
+    text: "¿Cómo te gusta viajar?",
+    options: [
+      { id: "mochila", text: "Con mochila" },
+      { id: "hotel", text: "Con hotel" },
+      { id: "roadtrip", text: "Road trip" },
+      { id: "cerca", text: "Cerca de casa" },
+    ],
+  },
+] as const;
+
+const OPCIONES = new Map<string, Set<string>>(
+  PREGUNTAS.map((p) => [p.id, new Set(p.options.map((o) => o.id))]),
+);
+
+const PARES_SQL = PREGUNTAS
+  .flatMap((p) => p.options.map((o) => `('${p.id}','${o.id}')`))
+  .join(",");
+
+const respuestasDe = async (visitor: string): Promise<Record<string, string>> => {
+  const filas = await db
+    .select()
+    .from(affinityAnswers)
+    .where(eq(affinityAnswers.visitorId, visitor));
+
+  const validas: Record<string, string> = {};
+  for (const fila of filas) {
+    if (OPCIONES.get(fila.question)?.has(fila.option)) validas[fila.question] = fila.option;
+  }
+  return validas;
+};
+
+const afinidadEntre = async (a: string, b: string): Promise<number | null> => {
+  const [mias, suyas] = await Promise.all([respuestasDe(a), respuestasDe(b)]);
+  const comunes = Object.keys(mias).filter((q) => q in suyas);
+  if (comunes.length < 2) return null;
+  const coincidencias = comunes.filter((q) => mias[q] === suyas[q]).length;
+  return Math.round((coincidencias * 100) / comunes.length);
 };
 
 type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
@@ -488,6 +581,7 @@ app.get("/api/profile", async (c) => {
       publicId: perfil.publicId,
       bio: perfil.bio,
       photos: await fotosDe(visitor),
+      affinity: { answers: await respuestasDe(visitor) },
     },
   });
 });
@@ -543,6 +637,7 @@ app.put("/api/profile", async (c) => {
       publicId: perfil.publicId,
       bio: perfil.bio,
       photos: await fotosDe(visitor),
+      affinity: { answers: await respuestasDe(visitor) },
     },
   });
 });
@@ -684,6 +779,23 @@ app.get("/api/sea", async (c) => {
       .from(blocks)
       .where(bloqueoEntre(visitor, bottles.authorVisitor));
 
+    const comunes = sql`(
+      select count(*) from affinity_answers ma
+      join affinity_answers sa on sa.question = ma.question and sa.visitor_id = ${bottles.authorVisitor}
+      where ma.visitor_id = ${visitor}
+        and (ma.question, ma.option) in (${sql.raw(PARES_SQL)})
+        and (sa.question, sa.option) in (${sql.raw(PARES_SQL)})
+    )`;
+    const coincidencias = sql`(
+      select count(*) from affinity_answers ma
+      join affinity_answers sa on sa.question = ma.question and sa.visitor_id = ${bottles.authorVisitor}
+      where ma.visitor_id = ${visitor}
+        and ma.option = sa.option
+        and (ma.question, ma.option) in (${sql.raw(PARES_SQL)})
+        and (sa.question, sa.option) in (${sql.raw(PARES_SQL)})
+    )`;
+    const puntuacion = sql`case when ${comunes} >= 2 then round(${coincidencias} * 100.0 / ${comunes}) else 50 end`;
+
     const [elegida] = await tx
       .select()
       .from(bottles)
@@ -694,7 +806,7 @@ app.get("/api/sea", async (c) => {
         notExists(reservadas),
         notExists(bloqueos),
       ))
-      .orderBy(sql`random()`)
+      .orderBy(sql`${puntuacion} desc, random()`)
       .limit(1)
       .for("update", { skipLocked: true });
 
@@ -904,6 +1016,12 @@ app.post("/api/bottles/:id/pick", async (c) => {
       authorPublicId: autora?.publicId ?? null,
       authorBio: autora?.bio ?? null,
       authorPhotos: autora ? await fotosDe(autora.visitorId) : [],
+      authorAffinity: autora
+        ? {
+          percentage: await afinidadEntre(visitor, autora.visitorId),
+          answers: await respuestasDe(autora.visitorId),
+        }
+        : { percentage: null, answers: {} },
     },
   });
 });
@@ -1481,6 +1599,58 @@ app.post("/api/reports", async (c) => {
     .returning();
 
   return c.json({ data: { id: creado.id } }, 201);
+});
+
+// --------------------------------------------------------------------- afinidad
+app.get("/api/affinity/questions", (c) => {
+  return c.json({
+    data: PREGUNTAS.map((p) => ({
+      id: p.id,
+      text: p.text,
+      options: p.options.map((o) => ({ id: o.id, text: o.text })),
+    })),
+  });
+});
+
+app.put("/api/affinity", async (c) => {
+  const body = await leerCuerpo(c);
+  if (!body) return c.json({ error: "cuerpo inválido" }, 400);
+
+  const visitor = c.get("visitor");
+  if (!visitor || !(await perfilDe(visitor))) {
+    return c.json({ error: "necesitas un alias" }, 403);
+  }
+
+  const answers = body.answers;
+  if (!answers || typeof answers !== "object" || Array.isArray(answers)) {
+    return c.json({ error: "answers debe ser un objeto" }, 422);
+  }
+
+  const entradas: { question: string; option: string }[] = [];
+  for (const [question, option] of Object.entries(answers as Record<string, unknown>)) {
+    if (!OPCIONES.has(question)) {
+      return c.json({ error: "pregunta desconocida" }, 422);
+    }
+    if (typeof option !== "string" || !OPCIONES.get(question)!.has(option)) {
+      return c.json({ error: "opción inválida" }, 422);
+    }
+    if (tieneControles(question) || tieneControles(option)) {
+      return c.json({ error: "respuesta inválida" }, 422);
+    }
+    entradas.push({ question, option });
+  }
+
+  // Reemplazo completo: lo que no venga, se borra.
+  await db.transaction(async (tx) => {
+    await tx.delete(affinityAnswers).where(eq(affinityAnswers.visitorId, visitor));
+    if (entradas.length > 0) {
+      await tx
+        .insert(affinityAnswers)
+        .values(entradas.map((e) => ({ visitorId: visitor, ...e })));
+    }
+  });
+
+  return c.json({ data: { answers: await respuestasDe(visitor) } });
 });
 
 // -------------------------------------------------------------- notificaciones

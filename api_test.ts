@@ -1975,7 +1975,7 @@ Deno.test("Mi perfil expone alias, publicId, bio y fotos ordenadas", async () =>
 
   const { data } = await (await app.request("/api/profile", { headers: { cookie } })).json();
 
-  assertEquals(Object.keys(data).sort(), ["alias", "bio", "photos", "publicId"]);
+  assertEquals(Object.keys(data).sort(), ["affinity", "alias", "bio", "photos", "publicId"]);
   assertEquals(data.photos.length, 2);
   assertEquals(Object.keys(data.photos[0]).sort(), ["id", "url"]);
 });
@@ -2337,4 +2337,218 @@ Deno.test("Bloqueados no generan notificaciones de mensajes ni de recogidas", as
 
   const { data } = await (await bandeja(ana.cookie)).json();
   assertEquals(data.length, 0);
+});
+
+// ------------------------------------------------------------------------ 11
+const RESPUESTAS_A = {
+  plan_ideal: "cena",
+  finde: "playa",
+  conversacion: "humor",
+  ritmo: "tranquilo",
+  comida: "cocinar",
+  viaje: "mochila",
+};
+
+const RESPUESTAS_B = {
+  plan_ideal: "cine",
+  finde: "montana",
+  conversacion: "memes",
+  ritmo: "intenso",
+  comida: "salir",
+  viaje: "hotel",
+};
+
+const ponerAfinidad = (cookie: string, answers: Record<string, string>) =>
+  app.request("/api/affinity", {
+    method: "PUT",
+    headers: { "content-type": "application/json", cookie },
+    body: JSON.stringify({ answers }),
+  });
+
+const afinidadDe = async (cookie: string) =>
+  (await (await app.request("/api/profile", { headers: { cookie } })).json()).data.affinity.answers;
+
+Deno.test("Las preguntas de afinidad son públicas y fijas", async () => {
+  const res = await app.request("/api/affinity/questions");
+
+  assertEquals(res.status, 200);
+  assertEquals(res.headers.get("set-cookie"), null);
+  const { data } = await res.json();
+  assertEquals(data.length, 6);
+  assertEquals(data.map((p: { id: string }) => p.id), [
+    "plan_ideal",
+    "finde",
+    "conversacion",
+    "ritmo",
+    "comida",
+    "viaje",
+  ]);
+  assertEquals(Object.keys(data[0]).sort(), ["id", "options", "text"]);
+});
+
+Deno.test("Guardar y leer mis respuestas", async () => {
+  const cookie = await crearVisita("Ana");
+
+  const res = await ponerAfinidad(cookie, RESPUESTAS_A);
+  assertEquals(res.status, 200);
+  assertEquals((await res.json()).data.answers, RESPUESTAS_A);
+  assertEquals(await afinidadDe(cookie), RESPUESTAS_A);
+});
+
+Deno.test("Rechaza respuestas inválidas y sin perfil", async () => {
+  const cookie = await crearVisita("Ana");
+
+  assertEquals((await ponerAfinidad(cookie, { inventada: "cena" })).status, 422);
+  assertEquals((await ponerAfinidad(cookie, { plan_ideal: "inventada" })).status, 422);
+  assertEquals(
+    (await app.request("/api/affinity", {
+      method: "PUT",
+      headers: { "content-type": "application/json", cookie },
+      body: JSON.stringify({ answers: { plan_ideal: 3 } }),
+    })).status,
+    422,
+  );
+
+  const sinPerfil = await app.request("/api/affinity", {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ answers: RESPUESTAS_A }),
+  });
+  assertEquals(sinPerfil.status, 403);
+  assertEquals(sinPerfil.headers.get("set-cookie"), null);
+});
+
+Deno.test("PUT reemplaza las respuestas anteriores", async () => {
+  const cookie = await crearVisita("Ana");
+  await ponerAfinidad(cookie, RESPUESTAS_A);
+
+  await ponerAfinidad(cookie, { plan_ideal: "cine", finde: "ciudad" });
+  assertEquals(await afinidadDe(cookie), { plan_ideal: "cine", finde: "ciudad" });
+
+  const visitorId = cookie.split("=")[1];
+  const filas = await db.execute(
+    sql`select count(*)::int as total from affinity_answers where visitor_id = ${visitorId}`,
+  );
+  assertEquals(filas.rows[0], { total: 2 });
+
+  await ponerAfinidad(cookie, {});
+  assertEquals(await afinidadDe(cookie), {});
+});
+
+const porcentajeDe = async (lector: string, autor: string) => {
+  await db.execute("delete from bottles");
+  await lanzar({ text: "Botella con afinidad" }, autor);
+  const { data: vista } = await (await pedirDelMar(lector)).json();
+  const { data } = await (await recoger(vista.id, lector)).json();
+  return data.authorAffinity;
+};
+
+Deno.test("Afinidad 100%, 0% y null sin suficientes preguntas en común", async () => {
+  const ana = await crearVisita("Ana");
+  const bea = await crearVisita("Bea");
+  await ponerAfinidad(ana, RESPUESTAS_A);
+  await ponerAfinidad(bea, RESPUESTAS_A);
+  assertEquals((await porcentajeDe(bea, ana)).percentage, 100);
+
+  const carla = await crearVisita("Carla");
+  await ponerAfinidad(carla, RESPUESTAS_B);
+  assertEquals((await porcentajeDe(carla, ana)).percentage, 0);
+
+  const dani = await crearVisita("Dani");
+  await ponerAfinidad(dani, { plan_ideal: "cine" });
+  const parcial = await porcentajeDe(dani, ana);
+  assertEquals(parcial.percentage, null);
+});
+
+Deno.test("La afinidad es simétrica", async () => {
+  await limpiarNotificaciones();
+  const ana = await crearVisita("Ana");
+  const bea = await crearVisita("Bea");
+  await ponerAfinidad(ana, RESPUESTAS_A);
+  await ponerAfinidad(bea, { ...RESPUESTAS_A, plan_ideal: "cine" });
+
+  const desdeBea = await porcentajeDe(bea, ana);
+  const desdeAna = await porcentajeDe(ana, bea);
+
+  assertEquals(desdeBea.percentage, desdeAna.percentage);
+});
+
+Deno.test("Sin respuestas del autor, el porcentaje es null y las respuestas vacías", async () => {
+  const ana = await crearVisita("Ana");
+  const bea = await crearVisita("Bea");
+
+  const afinidad = await porcentajeDe(bea, ana);
+  assertEquals(afinidad, { percentage: null, answers: {} });
+});
+
+Deno.test("El mar prioriza la botella de mayor afinidad", async () => {
+  await db.execute("delete from bottles");
+  const lectora = await crearVisita("Lectora");
+  const alta = await crearVisita("Alta");
+  const baja = await crearVisita("Baja");
+
+  await ponerAfinidad(lectora, RESPUESTAS_A);
+  await ponerAfinidad(alta, RESPUESTAS_A);
+  await ponerAfinidad(baja, RESPUESTAS_B);
+
+  await lanzar({ text: "Botella de alta afinidad" }, alta);
+  await lanzar({ text: "Botella de baja afinidad" }, baja);
+
+  const { data } = await (await pedirDelMar(lectora)).json();
+  assertEquals(data.text, "Botella de alta afinidad");
+});
+
+Deno.test("Sin respuestas el mar sigue funcionando y es anónimo", async () => {
+  await db.execute("delete from bottles");
+  const lectora = await crearVisita("Lectora");
+  const autora = await crearVisita("Autora");
+  await lanzar({ text: "Botella sin afinidad" }, autora);
+
+  const { data } = await (await pedirDelMar(lectora)).json();
+  assertEquals(data.text, "Botella sin afinidad");
+  assertEquals(Object.keys(data).sort(), ["id", "text"]);
+});
+
+Deno.test("Un bloqueado ni aparece ni revela sus respuestas", async () => {
+  await limpiarBloqueos();
+  await db.execute("delete from bottles");
+  const ana = await visitanteCompleto("Ana");
+  const bea = await visitanteCompleto("Bea");
+  await ponerAfinidad(ana.cookie, RESPUESTAS_A);
+  await ponerAfinidad(bea.cookie, RESPUESTAS_A);
+  await lanzar({ text: "Botella que no veré", }, ana.cookie);
+
+  const { data: vista } = await (await pedirDelMar(bea.cookie)).json();
+  await bloquear(bea.publicId, ana.cookie);
+
+  assertEquals((await recoger(vista.id, bea.cookie)).status, 403);
+  assertEquals((await (await pedirDelMar(bea.cookie)).json()).data, null);
+});
+
+Deno.test("Una respuesta con pregunta obsoleta se ignora", async () => {
+  const cookie = await crearVisita("Ana");
+  const visitorId = cookie.split("=")[1];
+  await ponerAfinidad(cookie, RESPUESTAS_A);
+
+  await db.execute(
+    sql`insert into affinity_answers (visitor_id, question, option) values (${visitorId}, 'vieja', 'lo_que_sea')`,
+  );
+
+  const respuestas = await afinidadDe(cookie);
+  assertEquals("vieja" in respuestas, false);
+  assertEquals(Object.keys(respuestas).length, 6);
+});
+
+Deno.test("La afinidad solo se expone en perfil y pick", async () => {
+  await limpiarNotificaciones();
+  const { cookieLectora, vista } = await prepararConversacion();
+  await ponerAfinidad(cookieLectora, RESPUESTAS_A);
+
+  const mar = await (await pedirDelMar()).json();
+  if (mar.data) assertEquals("authorAffinity" in mar.data, false);
+
+  const mine = await (await app.request("/api/bottles/mine", { headers: { cookie: cookieLectora } })).json();
+  assertEquals(mine.data.length, 0);
+  assertEquals((await (await app.request("/api/notifications", { headers: { cookie: cookieLectora } })).json()).data.every((n: object) => !("affinity" in n)), true);
+  assertEquals(vista.id > 0, true);
 });

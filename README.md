@@ -37,6 +37,8 @@ deno task dev           # http://localhost:8000
 | GET    | `/api/notifications`        | Bandeja: `{ data, unread }`, últimas 50             |
 | POST   | `/api/notifications/:id/read` | Marcar una como leída                             |
 | POST   | `/api/notifications/read-all` | Marcar todas como leídas                          |
+| GET    | `/api/affinity/questions`  | Las 6 preguntas del cuestionario                    |
+| PUT    | `/api/affinity`            | Guardar/reemplazar mis respuestas (`{ answers }`)   |
 | POST   | `/api/blocks`               | Bloquear a alguien (`{ publicId }`)                 |
 | DELETE | `/api/blocks/:publicId`     | Desbloquear                                         |
 | GET    | `/api/blocks`               | Mis bloqueos (`publicId` y alias)                   |
