@@ -25,8 +25,8 @@ deno task dev           # http://localhost:8000
 | ------ | --------------------------- | --------------------------------------------------- |
 | GET    | `/`                         | Saludo                                              |
 | GET    | `/health`                   | Estado + versión de Postgres                        |
-| POST   | `/api/auth/register`        | Crear cuenta (`{ email, password }`) → `{ token, email }` |
-| POST   | `/api/auth/login`           | Iniciar sesión → `{ token, email }`                 |
+| POST   | `/api/auth/register`        | Crear cuenta (`{ email, password }`) → `{ data: { token, email } }` |
+| POST   | `/api/auth/login`           | Iniciar sesión → `{ data: { token, email } }`       |
 | GET    | `/api/auth/me`              | Email de la cuenta (requiere `Bearer`)              |
 | POST   | `/api/auth/logout`          | Cerrar la sesión actual                             |
 | POST   | `/api/auth/logout-all`      | Cerrar todas las sesiones de la cuenta              |
@@ -72,10 +72,10 @@ deno task dev           # http://localhost:8000
 La identidad anónima viaja en la cookie `visitor` (UUID). Con cuenta se usa `Authorization: Bearer <token>`;
 si el visitante de la cookie tiene cuenta, la cookie deja de valer (`401`).
 
-Variables de entorno: `PORT` (8000), `PGDATA_DIR` (`./data/pgdata`), `UPLOADS_DIR` (`./data/uploads`) y **`TOKEN_PEPPER`** (≥32 bytes; en producción sin él el proceso no arranca, en desarrollo se usa uno y se avisa) y `COOKIE_SECURE=1` si sirves por HTTPS. Las contraseñas se guardan con
+Variables de entorno: `PORT` (8000), `PGDATA_DIR` (`./data/pgdata`), `UPLOADS_DIR` (`./data/uploads`), **`TOKEN_PEPPER`** (≥32 bytes), `COOKIE_SECURE=1` si sirves por HTTPS y `ENV=production` (sin `TOKEN_PEPPER` propio, en producción el proceso no arranca; en desarrollo se usa uno y se avisa). Las contraseñas se guardan con
 PBKDF2-SHA256 (600 000 iteraciones) y los tokens solo como HMAC-SHA256 con ese pimiento.
 
-Reglas: descartar exige haber visto la botella (`403` si no); una conversación fijada no se puede descartar ni liberar (`409`); mensajes de 1–500 con `?before=<id>` para paginar; `destroy` la saca del mar para todos para siempre y `return` no cambia su disponibilidad. El cuerpo de las peticiones está limitado a 8 KB (`413`), salvo la subida de fotos (6 MB de cuerpo, 5 MB por archivo). Las fotos se validan por sus bytes (JPEG/PNG/WebP) y se sirven con `nosniff`.
+Reglas: descartar exige haber visto la botella (`403` si no); una conversación fijada no se puede descartar ni liberar (`409`); mensajes de 1–500 con `?before=<id>` para paginar; `destroy` la saca del mar para todos para siempre y `return` no cambia su disponibilidad. El cuerpo de las peticiones está limitado a 8 KB (`413`), salvo la subida de fotos (6 MB de cuerpo, 5 MB por archivo). Las fotos se validan por sus bytes y estructura (JPEG/PNG/WebP), se guardan **sin metadatos EXIF/XMP** y se sirven con `nosniff`.
 
 ```bash
 curl http://localhost:8000/health

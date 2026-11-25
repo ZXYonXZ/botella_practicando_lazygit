@@ -42,8 +42,12 @@ const asciiEn = (bytes: Uint8Array, desde: number, texto: string) =>
   texto.split("").every((c, i) => bytes[desde + i] === c.charCodeAt(0));
 
 const detectarImagen = (bytes: Uint8Array): { mime: string; ext: string } | null => {
-  // PNG: firma de 8 bytes, chunk IHDR y longitud mínima de un PNG real.
-  if (bytes.length >= 33 && PNG.every((b, i) => bytes[i] === b) && asciiEn(bytes, 12, "IHDR")) {
+  // PNG: firma, chunk IHDR con longitud 13, y chunk IEND al final.
+  if (
+    bytes.length >= 45 && PNG.every((b, i) => bytes[i] === b) &&
+    bytes[8] === 0 && bytes[9] === 0 && bytes[10] === 0 && bytes[11] === 13 &&
+    asciiEn(bytes, 12, "IHDR") && asciiEn(bytes, bytes.length - 8, "IEND")
+  ) {
     return { mime: "image/png", ext: "png" };
   }
   // JPEG: SOI al principio y EOI al final.
@@ -65,6 +69,72 @@ const detectarImagen = (bytes: Uint8Array): { mime: string; ext: string } | null
     }
   }
   return null;
+};
+
+const quitarMetadatos = (bytes: Uint8Array, tipo: { mime: string; ext: string }): Uint8Array => {
+  if (tipo.ext === "jpg") return quitarAppJpeg(bytes);
+  if (tipo.ext === "png") return quitarChunksPng(bytes);
+  return quitarChunksWebp(bytes);
+};
+
+const quitarAppJpeg = (bytes: Uint8Array): Uint8Array => {
+  const salida: number[] = [0xff, 0xd8];
+  let i = 2;
+  while (i + 3 < bytes.length) {
+    if (bytes[i] !== 0xff) break;
+    const marcador = bytes[i + 1];
+    if (marcador === 0xda) {
+      for (let j = i; j < bytes.length; j++) salida.push(bytes[j]);
+      return new Uint8Array(salida);
+    }
+    if (marcador === 0xd9) return new Uint8Array([...salida, 0xff, 0xd9]);
+    const largo = (bytes[i + 2] << 8) | bytes[i + 3];
+    const esMetadato = (marcador >= 0xe1 && marcador <= 0xef) || marcador === 0xfe;
+    if (!esMetadato) {
+      for (let j = i; j < i + 2 + largo && j < bytes.length; j++) salida.push(bytes[j]);
+    }
+    i += 2 + largo;
+  }
+  for (let j = i; j < bytes.length; j++) salida.push(bytes[j]);
+  return new Uint8Array(salida);
+};
+
+const quitarChunksPng = (bytes: Uint8Array): Uint8Array => {
+  const salida: number[] = [];
+  for (let i = 0; i < 8; i++) salida.push(bytes[i]);
+  let i = 8;
+  while (i + 8 <= bytes.length) {
+    const largo = (bytes[i] << 24) | (bytes[i + 1] << 16) | (bytes[i + 2] << 8) | bytes[i + 3];
+    const tipoChunk = String.fromCharCode(bytes[i + 4], bytes[i + 5], bytes[i + 6], bytes[i + 7]);
+    const total = 12 + largo;
+    const esMetadato = ["tEXt", "zTXt", "iTXt", "eXIf"].includes(tipoChunk);
+    if (!esMetadato) {
+      for (let j = i; j < i + total && j < bytes.length; j++) salida.push(bytes[j]);
+    }
+    i += total;
+  }
+  return new Uint8Array(salida);
+};
+
+const quitarChunksWebp = (bytes: Uint8Array): Uint8Array => {
+  const trozos: number[] = [];
+  let i = 12;
+  while (i + 8 <= bytes.length) {
+    const tipoChunk = String.fromCharCode(bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]);
+    const largo = bytes[i + 4] | (bytes[i + 5] << 8) | (bytes[i + 6] << 16) | (bytes[i + 7] << 24);
+    const total = 8 + largo + (largo % 2);
+    if (tipoChunk !== "EXIF" && tipoChunk !== "XMP ") {
+      for (let j = i; j < i + total && j < bytes.length; j++) trozos.push(bytes[j]);
+    }
+    i += total;
+  }
+  const total = 12 + trozos.length;
+  const salida = new Uint8Array(total);
+  salida.set([0x52, 0x49, 0x46, 0x46], 0);
+  new DataView(salida.buffer).setUint32(4, total - 8, true);
+  salida.set([0x57, 0x45, 0x42, 0x50], 8);
+  salida.set(trozos, 12);
+  return salida;
 };
 
 const NOMBRE_FOTO = /^[0-9a-f-]{36}\.(png|jpg|webp)$/;
@@ -607,7 +677,7 @@ app.put("/api/profile", async (c) => {
   }
 
   const alias = body.alias.trim();
-  if (tieneControles(alias)) {
+  if (textoRoto(alias) || tieneControles(alias)) {
     return c.json({ error: "el alias contiene caracteres no permitidos" }, 422);
   }
 
@@ -625,7 +695,7 @@ app.put("/api/profile", async (c) => {
     if (texto === "") {
       bio = null;
     } else {
-      if (tieneInvisibles(texto) || [...texto].length > 300) {
+      if (textoRoto(texto) || tieneInvisibles(texto) || [...texto].length > 300) {
         return c.json({ error: "la bio no puede pasar de 300 caracteres" }, 422);
       }
       bio = texto;
@@ -660,6 +730,7 @@ app.put("/api/profile", async (c) => {
 const INVISIBLES = /[\p{Cc}\p{Cf}]/u;
 const tieneInvisibles = (texto: string) => INVISIBLES.test(texto.replace(/[\n\r\t\u200d]/g, ""));
 const tieneControles = (texto: string) => INVISIBLES.test(texto);
+const textoRoto = (texto: string) => !texto.isWellFormed();
 
 // -------------------------------------------------------------------- mis botellas
 const estadoBotella = (
@@ -722,7 +793,7 @@ app.post("/api/bottles", async (c) => {
   }
 
   const text = body.text.trim();
-  if (tieneInvisibles(text)) {
+  if (textoRoto(text) || tieneInvisibles(text)) {
     return c.json({ error: "el texto contiene caracteres no permitidos" }, 422);
   }
 
@@ -824,11 +895,8 @@ app.get("/api/sea", async (c) => {
 
     if (!elegida) return null;
 
-    // Sin perfil no se registra la vista: si no, la botella quedaría quemada para siempre.
-    if (perfil) {
-      await tx.insert(bottleViews).values({ bottleId: elegida.id, visitorId: visitor })
-        .onConflictDoNothing();
-    }
+    await tx.insert(bottleViews).values({ bottleId: elegida.id, visitorId: visitor })
+      .onConflictDoNothing();
 
     return elegida;
   });
@@ -1164,7 +1232,9 @@ const conversacionDePareja = (a: string, b: string) =>
 const validarTextoMensaje = (body: Record<string, unknown>) => {
   if (typeof body.text !== "string") return { error: "el mensaje es obligatorio" };
   const text = body.text.trim();
-  if (tieneInvisibles(text)) return { error: "el mensaje contiene caracteres no permitidos" };
+  if (textoRoto(text) || tieneInvisibles(text)) {
+    return { error: "el mensaje contiene caracteres no permitidos" };
+  }
   const largo = [...text].length;
   if (largo < 1 || largo > 500) {
     return { error: "el mensaje debe tener entre 1 y 500 caracteres" };
@@ -1480,9 +1550,10 @@ app.post("/api/profile/photos", async (c) => {
     if (!(foto instanceof File)) return c.json({ error: "falta la foto" }, 422);
     if (foto.size > 5 * 1024 * 1024) return c.json({ error: "la foto pasa de 5 MB" }, 413);
 
-    const bytes = new Uint8Array(await foto.arrayBuffer());
-    const tipo = detectarImagen(bytes);
+    const originales = new Uint8Array(await foto.arrayBuffer());
+    const tipo = detectarImagen(originales);
     if (!tipo) return c.json({ error: "formato no permitido" }, 422);
+    const bytes = quitarMetadatos(originales, tipo);
 
     if (!puedeSubir(visitor)) return c.json({ error: "demasiadas subidas" }, 429);
 
@@ -1632,6 +1703,50 @@ app.post("/api/blocks", async (c) => {
       and(eq(swipes.visitorId, visitor), eq(swipes.targetVisitor, objetivo.visitorId)),
       and(eq(swipes.visitorId, objetivo.visitorId), eq(swipes.targetVisitor, visitor)),
     ));
+
+    const asistenciaFuera = await tx.execute(sql`
+      delete from plan_attendees pa
+      using plans p
+      where pa.plan_id = p.id
+        and pa.status = 'confirmado'
+        and (
+          (pa.visitor_id = ${visitor} and p.creator_visitor = ${objetivo.visitorId})
+          or (pa.visitor_id = ${objetivo.visitorId} and p.creator_visitor = ${visitor})
+        )
+      returning pa.plan_id as plan_id, p.creator_visitor as creator
+    `);
+
+    for (const fila of asistenciaFuera.rows as { plan_id: number; creator: string }[]) {
+      const espera = await tx
+        .select()
+        .from(planAttendees)
+        .where(and(eq(planAttendees.planId, fila.plan_id), eq(planAttendees.status, "espera")))
+        .orderBy(planAttendees.id);
+
+      for (const candidato of espera) {
+        const [bloqueo] = await tx
+          .select()
+          .from(blocks)
+          .where(bloqueoEntre(fila.creator, candidato.visitorId))
+          .limit(1);
+        if (bloqueo) continue;
+        await tx
+          .update(planAttendees)
+          .set({ status: "confirmado" })
+          .where(eq(planAttendees.id, candidato.id));
+        break;
+      }
+    }
+
+    await tx.execute(sql`
+      delete from plan_attendees pa
+      using plans p
+      where pa.plan_id = p.id
+        and (
+          (pa.visitor_id = ${visitor} and p.creator_visitor = ${objetivo.visitorId})
+          or (pa.visitor_id = ${objetivo.visitorId} and p.creator_visitor = ${visitor})
+        )
+    `);
 
     for (const reserva of entreLaPareja) {
       await tx
@@ -2249,14 +2364,18 @@ app.post("/api/plans", async (c) => {
   const startsAt = fechaFutura(body.startsAt);
 
   const tituloLargo = largoTexto(title);
-  if (tituloLargo < 3 || tituloLargo > 80 || tieneControles(title)) {
+  if (tituloLargo < 3 || tituloLargo > 80 || textoRoto(title) || tieneControles(title)) {
     return c.json({ error: "el título debe tener entre 3 y 80 caracteres" }, 422);
   }
-  if (description !== null && (description === undefined || largoTexto(description) > 500 || tieneControles(description))) {
+  if (
+    description !== null &&
+    (description === undefined || largoTexto(description) > 500 || textoRoto(description) ||
+      tieneControles(description))
+  ) {
     return c.json({ error: "la descripción no puede pasar de 500 caracteres" }, 422);
   }
   const lugarLargo = largoTexto(place);
-  if (lugarLargo < 3 || lugarLargo > 100 || tieneControles(place)) {
+  if (lugarLargo < 3 || lugarLargo > 100 || textoRoto(place) || tieneControles(place)) {
     return c.json({ error: "el sitio debe tener entre 3 y 100 caracteres" }, 422);
   }
   if (lat === null || lng === null || Math.abs(lat) > 90 || Math.abs(lng) > 180) {
@@ -2422,6 +2541,9 @@ app.post("/api/plans/:id/join", async (c) => {
 
   const [plan] = await db.select().from(plans).where(eq(plans.id, id)).limit(1);
   if (!plan) return c.json({ error: "plan no encontrado" }, 404);
+  if (plan.creatorVisitor === visitor) {
+    return c.json({ error: "eres el creador de este plan" }, 422);
+  }
   if (await estanBloqueados(visitor, plan.creatorVisitor)) {
     return c.json({ error: "no puedes interactuar con esa persona" }, 403);
   }

@@ -853,17 +853,19 @@ Deno.test("Rechaza un alias invisible", async () => {
   assertEquals(res.status, 422);
 });
 
-Deno.test("Ver el mar sin perfil no quema la botella", async () => {
+Deno.test("Ver el mar sin perfil no rompe el onboarding", async () => {
   await db.execute("delete from bottles");
   await lanzar({ text: "Botella no quemada" });
 
   const sinPerfil = await pedirDelMar();
   const cookie = (sinPerfil.headers.get("set-cookie") ?? "").split(";")[0];
+  const { data: vista } = await sinPerfil.json();
 
   await ponerPerfil("Tarde", cookie);
 
-  const { data } = await (await pedirDelMar(cookie)).json();
-  assertEquals(data.text, "Botella no quemada");
+  // La vista quedó registrada, así que ya no vuelve a salir, pero sí se puede recoger.
+  assertEquals((await (await pedirDelMar(cookie)).json()).data, null);
+  assertEquals((await recoger(vista.id, cookie)).status, 200);
 });
 
 // ------------------------------------------------------------------------- 5
@@ -1792,11 +1794,13 @@ Deno.test("Bloquear funciona con identidad de cuenta", async () => {
 const UPLOADS_TEST = "./data/test-uploads";
 
 const png = (extra = 0) => {
-  // firma + longitud del IHDR + "IHDR" + 13 bytes de datos + CRC
-  const bytes = new Uint8Array(33 + extra);
+  // firma + IHDR (13 bytes) + IEND: estructura mínima que acepta la API
+  const bytes = new Uint8Array(45 + extra);
   bytes.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], 0);
   bytes.set([0, 0, 0, 13], 8);
   bytes.set([0x49, 0x48, 0x44, 0x52], 12);
+  bytes.set([0, 0, 0, 0], bytes.length - 12);
+  bytes.set([0x49, 0x45, 0x4e, 0x44], bytes.length - 8);
   return bytes;
 };
 
@@ -1897,10 +1901,10 @@ Deno.test("Acepta 5 MB y rechaza 5 MB más uno", async () => {
   await limpiarFotos();
   const cookie = await crearVisita("Ana");
 
-  const grande = png(5 * 1024 * 1024 - 33);
+  const grande = png(5 * 1024 * 1024 - 45);
   assertEquals((await subirFoto(grande, "image/png", cookie)).status, 201);
 
-  const demasiado = png(5 * 1024 * 1024 - 32);
+  const demasiado = png(5 * 1024 * 1024 - 44);
   assertEquals((await subirFoto(demasiado, "image/png", cookie)).status, 413);
 });
 
@@ -2587,12 +2591,19 @@ Deno.test("El mazo muestra un perfil con claves exactas y sin UUID de visitante"
   const objetivo = await visitanteCompleto("Objetivo");
   await ponerPerfilBio("Objetivo", "Mi bio para el mazo", objetivo.cookie);
 
+  await db.execute(sql`
+    insert into swipes (visitor_id, target_visitor, action)
+    select ${lectora.visitorId}, visitor_id, 'discard' from profiles
+    where visitor_id not in (${lectora.visitorId}, ${objetivo.visitorId})
+    on conflict do nothing
+  `);
+
   const { data } = await (await mazo(lectora.cookie)).json();
 
   assertEquals(Object.keys(data).sort(), ["affinity", "alias", "bio", "photos", "publicId"]);
   assertEquals(Object.keys(data.affinity), ["percentage"]);
   assertEquals("visitorId" in data, false);
-  assertEquals(data.publicId === objetivo.publicId || data.publicId !== objetivo.visitorId, true);
+  assertEquals(data.publicId, objetivo.publicId);
 });
 
 Deno.test("El mazo exige perfil y no reparte cookie", async () => {
@@ -3233,14 +3244,18 @@ Deno.test("Salir de la espera no promueve a nadie", async () => {
   const ana = await crearVisita("Ana");
   const bea = await crearVisita("Bea");
   const carla = await crearVisita("Carla");
+  const dani = await crearVisita("Dani");
   const { data: plan } = await (await crearPlan(planValido({ capacity: 1 }), ana)).json();
 
   await apuntarseAPlan(plan.id, bea);
   await apuntarseAPlan(plan.id, carla);
+  await apuntarseAPlan(plan.id, dani);
   await salirDePlan(plan.id, carla);
 
-  const { data: detalle } = await (await verPlan(plan.id, bea)).json();
-  assertEquals(detalle.confirmed, 1);
+  const { data: detalle } = await (await verPlan(plan.id, dani)).json();
+  assertEquals(detalle.myStatus, "espera");
+  const { data: detalleBea } = await (await verPlan(plan.id, bea)).json();
+  assertEquals(detalleBea.confirmed, 1);
 });
 
 Deno.test("Apuntarse dos veces es idempotente", async () => {
@@ -3278,9 +3293,10 @@ Deno.test("Planes inexistentes, ids inválidos y planes pasados", async () => {
   assertEquals((await verPlan(0, ana)).status, 404);
   assertEquals((await apuntarseAPlan(999999, ana)).status, 404);
 
+  const bea = await crearVisita("Bea");
   const { data: plan } = await (await crearPlan(planValido(), ana)).json();
   await db.execute(sql`update plans set starts_at = now() - interval '1 hour' where id = ${plan.id}`);
-  assertEquals((await apuntarseAPlan(plan.id, ana)).status, 409);
+  assertEquals((await apuntarseAPlan(plan.id, bea)).status, 409);
 });
 
 Deno.test("Solo el creador ve los asistentes", async () => {
@@ -3311,4 +3327,99 @@ Deno.test("Apuntarse no crea notificaciones", async () => {
   const despues = await db.execute("select count(*)::int as total from notifications");
 
   assertEquals(despues.rows[0], antes.rows[0]);
+});
+
+Deno.test("Un PNG de cabecera sin IEND se rechaza", async () => {
+  await limpiarFotos();
+  const cookie = await crearVisita("Ana");
+  const falso = new Uint8Array(33);
+  falso.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], 0);
+  falso.set([0, 0, 0, 13], 8);
+  falso.set([0x49, 0x48, 0x44, 0x52], 12);
+
+  assertEquals((await subirFoto(falso, "image/png", cookie)).status, 422);
+});
+
+Deno.test("Las fotos se guardan sin EXIF", async () => {
+  await limpiarFotos();
+  const cookie = await crearVisita("Ana");
+  const exif = new TextEncoder().encode("Exif\u0000\u0000GPS-OCULTO");
+  const bytes = new Uint8Array(2 + 2 + 2 + exif.length + 2);
+  bytes.set([0xff, 0xd8, 0xff, 0xe1], 0);
+  bytes[4] = (2 + exif.length) >> 8;
+  bytes[5] = (2 + exif.length) & 0xff;
+  bytes.set(exif, 6);
+  bytes.set([0xff, 0xd9], bytes.length - 2);
+
+  const res = await subirFoto(bytes, "image/jpeg", cookie);
+  assertEquals(res.status, 201);
+  const { data } = await res.json();
+
+  const foto = await app.request(`/api/photos/${data.id}`);
+  const servidos = new Uint8Array(await foto.arrayBuffer());
+  assertEquals(servidos.length < bytes.length, true);
+  assertEquals(new TextDecoder().decode(servidos).includes("GPS-OCULTO"), false);
+});
+
+Deno.test("El creador no puede apuntarse a su propio plan", async () => {
+  await limpiarPlanes();
+  const ana = await crearVisita("Ana");
+  const { data: plan } = await (await crearPlan(planValido(), ana)).json();
+
+  assertEquals((await apuntarseAPlan(plan.id, ana)).status, 422);
+});
+
+Deno.test("Dos personas compiten por la última plaza a la vez", async () => {
+  await limpiarPlanes();
+  const ana = await crearVisita("Ana");
+  const bea = await crearVisita("Bea");
+  const carla = await crearVisita("Carla");
+  const { data: plan } = await (await crearPlan(planValido({ capacity: 1 }), ana)).json();
+
+  const [a, b] = await Promise.all([
+    (await apuntarseAPlan(plan.id, bea)).json(),
+    (await apuntarseAPlan(plan.id, carla)).json(),
+  ]);
+
+  assertEquals([a.data.status, b.data.status].sort(), ["confirmado", "espera"]);
+  const filas = await db.execute(
+    sql`select count(*)::int as total from plan_attendees where plan_id = ${plan.id} and status = 'confirmado'`,
+  );
+  assertEquals(filas.rows[0], { total: 1 });
+});
+
+Deno.test("Bloquear a un asistente libera su plaza y asciende la espera", async () => {
+  await limpiarPlanes();
+  const ana = await visitanteCompleto("Ana");
+  const bea = await visitanteCompleto("Bea");
+  const carla = await visitanteCompleto("Carla");
+  const { data: plan } = await (await crearPlan(planValido({ capacity: 1 }), ana.cookie)).json();
+
+  await apuntarseAPlan(plan.id, bea.cookie);
+  await apuntarseAPlan(plan.id, carla.cookie);
+
+  await bloquear(bea.publicId, ana.cookie);
+
+  const { data: detalle } = await (await verPlan(plan.id, carla.cookie)).json();
+  assertEquals(detalle.myStatus, "confirmado");
+  assertEquals(detalle.confirmed, 1);
+});
+
+Deno.test("Radio por defecto de 25 km y listado anónimo", async () => {
+  await limpiarPlanes();
+  const ana = await crearVisita("Ana");
+  await crearPlan(planValido({ title: "A 111 km", lat: 41.4168, lng: -3.7038 }), ana);
+
+  const { data: cerca } = await (await listarPlanes(`?lat=${MADRID.lat}&lng=${MADRID.lng}`)).json();
+  assertEquals(cerca.length, 0);
+
+  const anonimo = await listarPlanes("?lat=40.4168&lng=-3.7038&radius=200");
+  assertEquals(anonimo.status, 200);
+  assertEquals((await anonimo.json()).data.length, 1);
+});
+
+Deno.test("Un texto con surrogate suelto se rechaza", async () => {
+  const res = await lanzar({ text: "\ud800abcde" });
+
+  assertEquals(res.status, 422);
 });
