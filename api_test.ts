@@ -1267,6 +1267,7 @@ Deno.test("Contraseña incorrecta y email inexistente dan el mismo 401", async (
   const email = correo();
   await registrar(email, "contraseña-larga");
 
+  const antes = await db.execute("select count(*)::int as total from sessions");
   const mala = await entrar(email, "contraseña-mala");
   const inexistente = await entrar(correo(), "contraseña-mala");
 
@@ -1274,8 +1275,8 @@ Deno.test("Contraseña incorrecta y email inexistente dan el mismo 401", async (
   assertEquals(inexistente.status, 401);
   assertEquals(await mala.text(), await inexistente.text());
 
-  const filas = await db.execute("select count(*)::int as total from sessions where account_id is null");
-  assertEquals(filas.rows[0], { total: 0 });
+  const despues = await db.execute("select count(*)::int as total from sessions");
+  assertEquals(despues.rows[0], antes.rows[0]);
 });
 
 Deno.test("En la base no hay contraseñas ni tokens en claro", async () => {
@@ -1791,14 +1792,29 @@ Deno.test("Bloquear funciona con identidad de cuenta", async () => {
 const UPLOADS_TEST = "./data/test-uploads";
 
 const png = (extra = 0) => {
-  const bytes = new Uint8Array(8 + extra);
-  bytes.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  // firma + longitud del IHDR + "IHDR" + 13 bytes de datos + CRC
+  const bytes = new Uint8Array(33 + extra);
+  bytes.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], 0);
+  bytes.set([0, 0, 0, 13], 8);
+  bytes.set([0x49, 0x48, 0x44, 0x52], 12);
   return bytes;
 };
 
-const jpeg = (extra = 4) => {
-  const bytes = new Uint8Array(3 + extra);
-  bytes.set([0xff, 0xd8, 0xff]);
+const jpeg = (extra = 0) => {
+  const bytes = new Uint8Array(5 + extra);
+  bytes.set([0xff, 0xd8, 0xff], 0);
+  bytes[bytes.length - 2] = 0xff;
+  bytes[bytes.length - 1] = 0xd9;
+  return bytes;
+};
+
+const webp = (extra = 4) => {
+  const total = 20 + extra;
+  const bytes = new Uint8Array(total);
+  bytes.set([0x52, 0x49, 0x46, 0x46], 0);
+  new DataView(bytes.buffer).setUint32(4, total - 8, true);
+  bytes.set([0x57, 0x45, 0x42, 0x50], 8);
+  bytes.set([0x56, 0x50, 0x38, 0x20], 12);
   return bytes;
 };
 
@@ -1881,10 +1897,10 @@ Deno.test("Acepta 5 MB y rechaza 5 MB más uno", async () => {
   await limpiarFotos();
   const cookie = await crearVisita("Ana");
 
-  const grande = png(5 * 1024 * 1024 - 16);
+  const grande = png(5 * 1024 * 1024 - 33);
   assertEquals((await subirFoto(grande, "image/png", cookie)).status, 201);
 
-  const demasiado = png(5 * 1024 * 1024);
+  const demasiado = png(5 * 1024 * 1024 - 32);
   assertEquals((await subirFoto(demasiado, "image/png", cookie)).status, 413);
 });
 
@@ -2050,4 +2066,275 @@ Deno.test("Ids de foto inválidos responden 404, nunca 500", async () => {
   assertEquals((await app.request("/api/photos/1")).status, 404);
   assertEquals((await app.request("/api/photos/no-es-uuid")).status, 404);
   assertEquals((await app.request("/api/photos/00000000-0000-0000-0000-000000000000")).status, 404);
+});
+
+Deno.test("Los ids gigantes responden 404 o 422, nunca 500", async () => {
+  const cookie = await crearVisita("Ana");
+  const bea = await visitanteCompleto("Bea");
+
+  assertEquals((await recoger(4_000_000_000, cookie)).status, 404);
+  assertEquals((await app.request("/api/bottles/mine?before=2147483648", { headers: { cookie } })).status, 422);
+  assertEquals(
+    (await reportar({ publicId: bea.publicId, reason: "spam", bottleId: 2147483648 }, cookie)).status,
+    422,
+  );
+});
+
+Deno.test("Rechaza un JPEG de tres bytes y un PNG de ocho", async () => {
+  await limpiarFotos();
+  const cookie = await crearVisita("Ana");
+
+  assertEquals((await subirFoto(new Uint8Array([0xff, 0xd8, 0xff]), "image/jpeg", cookie)).status, 422);
+  assertEquals(
+    (await subirFoto(new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), "image/png", cookie)).status,
+    422,
+  );
+});
+
+Deno.test("Acepta un WebP con contenedor coherente", async () => {
+  await limpiarFotos();
+  const cookie = await crearVisita("Ana");
+
+  const res = await subirFoto(webp(16), "image/webp", cookie);
+  assertEquals(res.status, 201);
+
+  const { data } = await res.json();
+  const foto = await app.request(`/api/photos/${data.id}`);
+  assertEquals(foto.headers.get("content-type"), "image/webp");
+});
+
+Deno.test("Un cuerpo de 7 MB se rechaza antes de autenticar", async () => {
+  const form = new FormData();
+  form.append("photo", new File([new Uint8Array(7 * 1024 * 1024) as unknown as BlobPart], "f.png", { type: "image/png" }));
+
+  const res = await app.request("/api/profile/photos", { method: "POST", body: form });
+
+  assertEquals(res.status, 413);
+});
+
+Deno.test("La cookie de una cuenta no puede subir ni borrar fotos", async () => {
+  await limpiarCuentas();
+  const alta = await registrar(correo(), "contraseña-larga");
+  const cookie = cookieDe(alta);
+
+  assertEquals((await subirFoto(png(8), "image/png", cookie)).status, 401);
+  assertEquals(
+    (await app.request("/api/profile/photos/00000000-0000-0000-0000-000000000000", {
+      method: "DELETE",
+      headers: { cookie },
+    })).status,
+    401,
+  );
+});
+
+Deno.test("pick y mensajes exponen el publicId del otro", async () => {
+  await limpiarFotos();
+  await db.execute("delete from bottles");
+  const ana = await visitanteCompleto("Ana");
+  await lanzar({ text: "Botella con publicId" }, ana.cookie);
+
+  const bea = await visitanteCompleto("Bea");
+  const { data: vista } = await (await pedirDelMar(bea.cookie)).json();
+  const { data: recogida } = await (await recoger(vista.id, bea.cookie)).json();
+  assertEquals(recogida.authorPublicId, ana.publicId);
+
+  const { data: mensaje } = await (await enviarMensaje(vista.id, "Hola", bea.cookie)).json();
+  assertEquals(mensaje.publicId, bea.publicId);
+});
+
+// ------------------------------------------------------------------------ 10
+const bandeja = (cookie: string) => app.request("/api/notifications", { headers: { cookie } });
+
+const limpiarNotificaciones = () => db.execute("delete from notifications");
+const leerNotif = (id: number, cookie: string) =>
+  app.request(`/api/notifications/${id}/read`, { method: "POST", headers: { cookie } });
+const leerTodas = (cookie: string) =>
+  app.request("/api/notifications/read-all", { method: "POST", headers: { cookie } });
+
+const deTipo = (data: { type: string }[], tipo: string) => data.filter((n) => n.type === tipo);
+
+Deno.test("Recoger una botella notifica al autor y no al que recoge", async () => {
+  await limpiarNotificaciones();
+  await db.execute("delete from bottles");
+  const ana = await visitanteCompleto("Ana");
+  const bea = await visitanteCompleto("Bea");
+  await lanzar({ text: "Botella que será recogida" }, ana.cookie);
+  await lanzar({ text: "Segunda botella de Ana" }, ana.cookie);
+
+  const { data: primera } = await (await pedirDelMar(bea.cookie)).json();
+  const { data: segunda } = await (await pedirDelMar(bea.cookie)).json();
+  assertEquals((await recoger(primera.id, bea.cookie)).status, 200);
+  assertEquals((await recoger(segunda.id, bea.cookie)).status, 409);
+
+  const { data: deAna } = await (await bandeja(ana.cookie)).json();
+  assertEquals(deTipo(deAna, "botella_recogida").length, 1);
+
+  const { data: deBea } = await (await bandeja(bea.cookie)).json();
+  assertEquals(deBea.length, 0);
+});
+
+Deno.test("Un mensaje notifica al otro participante, nunca a quien escribe", async () => {
+  await limpiarNotificaciones();
+  const { cookieAutora, cookieLectora, vista } = await prepararConversacion();
+
+  await enviarMensaje(vista.id, "Hola desde el mar", cookieLectora);
+  const { data: deAutora } = await (await bandeja(cookieAutora)).json();
+  assertEquals(deTipo(deAutora, "mensaje_nuevo").length, 1);
+
+  const { data: deLectora } = await (await bandeja(cookieLectora)).json();
+  assertEquals(deTipo(deLectora, "mensaje_nuevo").length, 0);
+
+  await enviarMensaje(vista.id, "Hola Bea", cookieAutora);
+  const { data: deLectoraDespues } = await (await bandeja(cookieLectora)).json();
+  assertEquals(deTipo(deLectoraDespues, "mensaje_nuevo").length, 1);
+});
+
+Deno.test("La reserva caducada avisa una sola vez aunque otro la recoja antes", async () => {
+  await limpiarNotificaciones();
+  await db.execute("delete from bottles");
+  const ana = await visitanteCompleto("Ana");
+  const bea = await visitanteCompleto("Bea");
+  await lanzar({ text: "Botella que caduca" }, ana.cookie);
+
+  const { data: vista } = await (await pedirDelMar(bea.cookie)).json();
+  assertEquals((await recoger(vista.id, bea.cookie)).status, 200);
+  await db.execute("update reservations set expires_at = now() - interval '1 hour' where confirmed_at is null");
+
+  const carla = await visitanteCompleto("Carla");
+  await pedirDelMar(carla.cookie);
+  assertEquals((await recoger(vista.id, carla.cookie)).status, 200);
+
+  const { data: primera } = await (await bandeja(bea.cookie)).json();
+  assertEquals(deTipo(primera, "reserva_caducada").length, 1);
+
+  const { data: segunda } = await (await bandeja(bea.cookie)).json();
+  assertEquals(deTipo(segunda, "reserva_caducada").length, 1);
+
+  const reservas = await db.execute("select count(*)::int as total from reservations");
+  assertEquals(reservas.rows[0], { total: 1 });
+});
+
+Deno.test("Dos lecturas simultáneas de la bandeja no duplican el aviso", async () => {
+  await limpiarNotificaciones();
+  await db.execute("delete from bottles");
+  const ana = await visitanteCompleto("Ana");
+  const bea = await visitanteCompleto("Bea");
+  await lanzar({ text: "Botella para dos lecturas" }, ana.cookie);
+
+  const { data: vista } = await (await pedirDelMar(bea.cookie)).json();
+  await recoger(vista.id, bea.cookie);
+  await db.execute("update reservations set expires_at = now() - interval '1 hour' where confirmed_at is null");
+
+  const [a, b] = await Promise.all([bandeja(bea.cookie), bandeja(bea.cookie)]);
+  assertEquals(a.status, 200);
+  assertEquals(b.status, 200);
+
+  const { data } = await (await bandeja(bea.cookie)).json();
+  assertEquals(deTipo(data, "reserva_caducada").length, 1);
+});
+
+Deno.test("La bandeja devuelve claves exactas, orden y contador", async () => {
+  await limpiarNotificaciones();
+  const { cookieAutora, cookieLectora, vista } = await prepararConversacion();
+  await enviarMensaje(vista.id, "Hola desde el mar", cookieLectora);
+
+  const cuerpo = await (await bandeja(cookieAutora)).json();
+
+  assertEquals(Object.keys(cuerpo).sort(), ["data", "unread"]);
+  assertEquals(typeof cuerpo.unread, "number");
+  assertEquals(cuerpo.data.length >= 1, true);
+  assertEquals(Object.keys(cuerpo.data[0]).sort(), ["bottleId", "createdAt", "id", "read", "type"]);
+  assertEquals(typeof cuerpo.data[0].read, "boolean");
+  assertEquals(cuerpo.data[0].id > cuerpo.data[1].id, true);
+});
+
+Deno.test("Marcar leída baja el contador; una ajena responde 404", async () => {
+  await limpiarNotificaciones();
+  const { cookieAutora, cookieLectora, vista } = await prepararConversacion();
+  await enviarMensaje(vista.id, "Hola desde el mar", cookieLectora);
+
+  const { data, unread } = await (await bandeja(cookieAutora)).json();
+  assertEquals(unread, 2); // recogida + mensaje
+
+  assertEquals((await leerNotif(data[0].id, cookieAutora)).status, 204);
+  assertEquals((await (await bandeja(cookieAutora)).json()).unread, unread - 1);
+  assertEquals((await leerNotif(data[0].id, cookieAutora)).status, 204);
+
+  const bea = (await (await app.request("/api/profile", { headers: { cookie: cookieLectora } })).json()).data;
+  assertEquals((await leerNotif(data[0].id, cookieLectora)).status, 404);
+  assertEquals(typeof bea.publicId, "string");
+});
+
+Deno.test("read-all deja todo leído y es idempotente", async () => {
+  await limpiarNotificaciones();
+  const { cookieAutora, cookieLectora, vista } = await prepararConversacion();
+  await enviarMensaje(vista.id, "Uno", cookieLectora);
+  await enviarMensaje(vista.id, "Dos", cookieLectora);
+
+  assertEquals((await leerTodas(cookieAutora)).status, 204);
+  assertEquals((await (await bandeja(cookieAutora)).json()).unread, 0);
+  assertEquals((await leerTodas(cookieAutora)).status, 204);
+});
+
+Deno.test("Solo se conservan las 50 notificaciones más recientes por visitante", async () => {
+  await limpiarNotificaciones();
+  const { cookieAutora, cookieLectora, vista } = await prepararConversacion();
+
+  for (let i = 0; i < 55; i++) await enviarMensaje(vista.id, `Mensaje ${i}`, cookieLectora);
+
+  const { data, unread } = await (await bandeja(cookieAutora)).json();
+  assertEquals(data.length, 50);
+  assertEquals(data[0].id > data[49].id, true);
+  assertEquals(unread <= 50, true);
+
+  const carla = await visitanteCompleto("Carla");
+  await limpiarNotificaciones();
+});
+
+Deno.test("Sin identidad no hay bandeja y no se reparte cookie", async () => {
+  const res = await app.request("/api/notifications");
+
+  assertEquals(res.status, 401);
+  assertEquals(res.headers.get("set-cookie"), null);
+});
+
+Deno.test("Ids de notificación inválidos responden 404", async () => {
+  const cookie = await crearVisita("Ana");
+
+  for (const id of ["abc", "0", "1.5", "4000000000"]) {
+    assertEquals((await leerNotif(Number(id) || 0, cookie)).status, 404);
+  }
+  assertEquals((await app.request("/api/notifications/abc/read", { method: "POST", headers: { cookie } })).status, 404);
+});
+
+Deno.test("Destruir la botella deja la notificación con bottleId nulo", async () => {
+  await limpiarNotificaciones();
+  await db.execute("delete from bottles");
+  const ana = await visitanteCompleto("Ana");
+  const bea = await visitanteCompleto("Bea");
+  await lanzar({ text: "Botella que se destruye" }, ana.cookie);
+
+  const { data: vista } = await (await pedirDelMar(bea.cookie)).json();
+  await recoger(vista.id, bea.cookie);
+  assertEquals((await descartar(vista.id, "destroy", bea.cookie)).status, 200);
+
+  const { data } = await (await bandeja(ana.cookie)).json();
+  assertEquals(data[0].type, "botella_recogida");
+  assertEquals(data[0].bottleId, null);
+});
+
+Deno.test("Bloqueados no generan notificaciones de mensajes ni de recogidas", async () => {
+  await limpiarNotificaciones();
+  await db.execute("delete from bottles");
+  const ana = await visitanteCompleto("Ana");
+  const bea = await visitanteCompleto("Bea");
+  await lanzar({ text: "Botella bloqueada" }, ana.cookie);
+
+  const { data: vista } = await (await pedirDelMar(bea.cookie)).json();
+  await bloquear(bea.publicId, ana.cookie);
+
+  assertEquals((await recoger(vista.id, bea.cookie)).status, 403);
+
+  const { data } = await (await bandeja(ana.cookie)).json();
+  assertEquals(data.length, 0);
 });

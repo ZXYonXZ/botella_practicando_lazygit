@@ -44,6 +44,10 @@ export const reservations = pgTable("reservations", {
   // Solo una reserva *sin confirmar* por visitante: las conversaciones fijas no ocupan hueco.
   uniqueIndex("reservations_visitor_pendiente").on(table.visitorId)
     .where(sql`${table.confirmedAt} is null`),
+  check(
+    "reservations_confirmada_infinita",
+    sql`${table.confirmedAt} is null or ${table.expiresAt} = 'infinity'`,
+  ),
 ]);
 
 export const messages = pgTable("messages", {
@@ -123,4 +127,19 @@ export const reports = pgTable("reports", {
 }, (table) => [
   check("reports_reason", sql`${table.reason} in ('acoso','spam','perfil_falso','otro')`),
   index("reports_reported_idx").on(table.reportedId),
+]);
+
+export const notifications = pgTable("notifications", {
+  id: serial("id").primaryKey(),
+  visitorId: varchar("visitor_id", { length: 64 }).notNull(),
+  type: varchar("type", { length: 20 }).notNull(),
+  bottleId: integer("bottle_id").references(() => bottles.id, { onDelete: "set null" }),
+  readAt: timestamp("read_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [
+  check(
+    "notifications_type",
+    sql`${table.type} in ('botella_recogida','mensaje_nuevo','reserva_caducada')`,
+  ),
+  index("notifications_visitor_idx").on(table.visitorId, table.id),
 ]);

@@ -452,3 +452,55 @@ Los tests usan `UPLOADS_DIR` apuntando a un directorio temporal y limpian `photo
 | 12 | `GET /api/photos/:id` con cookie de cuenta (regresión de `<img>`) → `200` |
 | 13 | Más de 10 subidas al día → `429` |
 | 14 | `GET /api/photos/<uuid inválido>` y un `filename` con `../` → `404`, nunca `500` |
+
+---
+
+# Plan — Historia 10 (aprobada v2: bandeja in-app)
+
+## Story
+As a person, I want to be notified when someone picks my bottle or replies, so that I don't have to keep checking.
+
+## Acceptance criteria
+- [ ] Given lancé una botella, when alguien la recoge, then tengo una notificación en mi bandeja.
+- [ ] Given hay una conversación, when la otra persona escribe, then me llega una notificación y al que escribe no.
+- [ ] Given mi reserva expiró sin mensajes, when abro la bandeja, then veo el aviso una sola vez (aunque otro la haya recogido antes).
+
+## Modelo
+- `notifications(id serial, visitor_id varchar(64), type varchar(20), bottle_id → bottles on delete set null, read_at nullable, created_at)` con `CHECK type in ('botella_recogida','mensaje_nuevo','reserva_caducada')` e índice `(visitor_id, id)`.
+- Retención: tras insertar, `delete … where visitor_id = $1 and id < (select id from notifications where visitor_id = $1 order by id desc offset 49 limit 1)`. Solo se recorta al insertar, nunca al leer.
+- Si se recortan no leídas, desaparecen; el contador `unread` se calcula sobre las que quedan.
+- Nunca se guarda ni se expone quién provocó el evento.
+
+## Eventos (dentro de la misma transacción que los provoca)
+- **Recogida**: al crear la reserva en `POST /pick`, se notifica al autor. Se emite dentro de la transacción de la reserva; si la reserva falla (`409`), no hay notificación.
+- **Mensaje**: al insertar el mensaje, se notifica al otro participante. Nunca a quien escribe, ni si el chat está bloqueado (`403` antes de insertar).
+- **Reserva caducada**: se emite con `DELETE … RETURNING` en **todos** los sitios que limpian reservas expiradas: el barrido de `pick`, liberar al bloquear y destruir. Así no se pierde el aviso aunque otro recoja la botella antes de que el dueño abra la bandeja.
+- El barrido perezoso dentro de `GET /api/notifications` queda como red de seguridad, en **una** transacción con `DELETE … RETURNING` filtrado por visitante (idempotente entre dos GET simultáneos).
+
+## Rutas
+- `GET /api/notifications` → `{ data: [{ id, type, bottleId, read, createdAt }], unread }`, más recientes primero, máximo 50. Sin identidad → `401` y **sin** repartir cookie.
+- `POST /api/notifications/:id/read` → `204`; `404` si no es mía (un solo `UPDATE … WHERE id AND visitor_id RETURNING`).
+- `POST /api/notifications/read-all` → `204` (idempotente).
+
+## Out of scope
+- Email, push, WebSocket.
+- Preferencias por tipo, agrupar mensajes consecutivos, silenciar.
+- Notificar bloqueos, reportes o cambios de perfil.
+- Paginación más allá de las 50.
+
+## Lista de tests
+
+| # | Test |
+|---|---|
+| 1 | Recoger notifica al autor y no al que recoge; un `pick` rechazado (`409`) no notifica |
+| 2 | Un mensaje notifica al otro participante en ambos sentidos, no a quien escribe |
+| 3 | Expirar y que **otro** recoja antes de abrir la bandeja: el dueño ve su `reserva_caducada` exactamente una vez |
+| 4 | Dos `GET` simultáneos tras una expiración generan una sola notificación y ambos responden `200` |
+| 5 | `GET` devuelve `{ data, unread }` con claves exactas, orden descendente y `read` booleano |
+| 6 | Marcar una como leída baja `unread`; segunda vez `204`; ajena `404` y no toca la del dueño |
+| 7 | `read-all` idempotente y `unread` a cero |
+| 8 | Retención: 49/50/51 notificaciones, y dos visitantes no se pisan |
+| 9 | Sin identidad la bandeja da `401` y no emite `Set-Cookie`; cookie de cuenta → `401` |
+| 10 | Ids inválidos (`abc`, `0`, `1.5`, >int4) → `404`, nunca `500` |
+| 11 | Destruir una botella deja sus notificaciones con `bottleId: null` y el `GET` no falla |
+| 12 | Los mensajes bloqueados y los picks bloqueados no crean notificaciones |

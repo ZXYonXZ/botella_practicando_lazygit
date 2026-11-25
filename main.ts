@@ -19,6 +19,7 @@ import {
   bottleViews,
   bottles,
   messages,
+  notifications,
   photos,
   profiles,
   reports,
@@ -30,19 +31,31 @@ import {
 const UPLOADS = Deno.env.get("UPLOADS_DIR") ?? "./data/uploads";
 const PNG = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
 
+const asciiEn = (bytes: Uint8Array, desde: number, texto: string) =>
+  texto.split("").every((c, i) => bytes[desde + i] === c.charCodeAt(0));
+
 const detectarImagen = (bytes: Uint8Array): { mime: string; ext: string } | null => {
-  if (bytes.length >= 8 && PNG.every((b, i) => bytes[i] === b)) {
+  // PNG: firma de 8 bytes, chunk IHDR y longitud mínima de un PNG real.
+  if (bytes.length >= 33 && PNG.every((b, i) => bytes[i] === b) && asciiEn(bytes, 12, "IHDR")) {
     return { mime: "image/png", ext: "png" };
   }
-  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+  // JPEG: SOI al principio y EOI al final.
+  if (
+    bytes.length >= 4 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff &&
+    bytes[bytes.length - 2] === 0xff && bytes[bytes.length - 1] === 0xd9
+  ) {
     return { mime: "image/jpeg", ext: "jpg" };
   }
-  const esRiff = bytes.length >= 12 && bytes[0] === 0x52 && bytes[1] === 0x49 &&
-    bytes[2] === 0x46 && bytes[3] === 0x46 && bytes[8] === 0x57 && bytes[9] === 0x45 &&
-    bytes[10] === 0x42 && bytes[11] === 0x50;
+  // WebP: contenedor RIFF con tamaño coherente y chunk VP8/VP8L/VP8X.
+  const esRiff = bytes.length >= 20 && asciiEn(bytes, 0, "RIFF") && asciiEn(bytes, 8, "WEBP");
   if (esRiff) {
     const tam = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(4, true);
-    if (tam + 8 === bytes.length) return { mime: "image/webp", ext: "webp" };
+    const chunk = asciiEn(bytes, 12, "VP8 ");
+    const chunkL = asciiEn(bytes, 12, "VP8L");
+    const chunkX = asciiEn(bytes, 12, "VP8X");
+    if (tam + 8 === bytes.length && (chunk || chunkL || chunkX)) {
+      return { mime: "image/webp", ext: "webp" };
+    }
   }
   return null;
 };
@@ -67,6 +80,9 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const PEPPER_DE_DESARROLLO = "pepper-de-desarrollo-no-usar-en-produccion";
 
 const PEPPER = Deno.env.get("TOKEN_PEPPER") ?? PEPPER_DE_DESARROLLO;
+if (Deno.env.get("ENV") === "production" && PEPPER === PEPPER_DE_DESARROLLO) {
+  throw new Error("Define TOKEN_PEPPER (32+ bytes) en producción");
+}
 if (import.meta.main && PEPPER === PEPPER_DE_DESARROLLO) {
   console.warn("⚠️  TOKEN_PEPPER no definido: usando el de desarrollo. Define uno de 32+ bytes.");
 }
@@ -93,10 +109,12 @@ const visitante = (c: Context): string | null => {
   return null;
 };
 
+const ATRIBUTOS_COOKIE = Deno.env.get("COOKIE_SECURE") === "1" ? "; Secure" : "";
+
 const repartirCookie = (c: Context, visitor: string) => {
   c.header(
     "set-cookie",
-    `${VISITOR_COOKIE}=${visitor}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000`,
+    `${VISITOR_COOKIE}=${visitor}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000${ATRIBUTOS_COOKIE}`,
   );
 };
 
@@ -125,10 +143,12 @@ const leerCuerpo = async (c: Context): Promise<Record<string, unknown> | null> =
   }
 };
 
+const ID_MAX = 2_147_483_647;
+
 const idValido = (raw: string): number | null => {
   if (!/^\d+$/.test(raw)) return null;
   const id = Number(raw);
-  return Number.isSafeInteger(id) && id > 0 ? id : null;
+  return Number.isSafeInteger(id) && id > 0 && id <= ID_MAX ? id : null;
 };
 
 // Drizzle envuelve el error original: hay que seguir la cadena `cause` para ver el código de Postgres.
@@ -160,6 +180,43 @@ const estanBloqueados = async (a: string, b: string) => {
   return fila !== undefined;
 };
 
+type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+const notificar = async (tx: Tx, visitor: string, type: string, bottleId: number | null) => {
+  await tx.insert(notifications).values({ visitorId: visitor, type, bottleId });
+  await tx.execute(sql`
+    delete from notifications
+    where visitor_id = ${visitor}
+      and id < (
+        select id from notifications
+        where visitor_id = ${visitor}
+        order by id desc
+        offset 49
+        limit 1
+      )
+  `);
+};
+
+const barrerExpiradas = async (tx: Tx, condiciones: ReturnType<typeof eq>[]) => {
+  const expiradas = await tx
+    .select()
+    .from(reservations)
+    .where(and(isNull(reservations.confirmedAt), lte(reservations.expiresAt, sql`now()`), ...condiciones));
+
+  for (const reserva of expiradas) {
+    const borradas = await tx
+      .delete(reservations)
+      .where(and(
+        eq(reservations.bottleId, reserva.bottleId),
+        isNull(reservations.confirmedAt),
+      ))
+      .returning();
+    if (borradas.length > 0) {
+      await notificar(tx, reserva.visitorId, "reserva_caducada", reserva.bottleId);
+    }
+  }
+};
+
 const perfilDe = async (visitor: string) => {
   const [perfil] = await db
     .select()
@@ -172,9 +229,21 @@ const perfilDe = async (visitor: string) => {
 export const app = new Hono<Entorno>();
 
 app.use(logger());
-const limiteNormal = bodyLimit({ maxSize: 8 * 1024 });
-app.use("/api/*", (c, next) =>
-  c.req.path === "/api/profile/photos" ? next() : limiteNormal(c, next));
+const respuesta413 = (c: Context) => c.json({ error: "cuerpo demasiado grande" }, 413);
+const limiteNormal = bodyLimit({ maxSize: 8 * 1024, onError: respuesta413 });
+const limiteFoto = bodyLimit({ maxSize: 6 * 1024 * 1024, onError: respuesta413 });
+
+app.use("/api/*", (c, next) => {
+  const esFoto = c.req.path === "/api/profile/photos";
+  return (esFoto ? limiteFoto : limiteNormal)(c, next);
+});
+
+app.use("/api/*", async (c, next) => {
+  if (c.req.method === "GET" && !c.req.path.startsWith("/api/photos/")) {
+    c.header("cache-control", "no-store");
+  }
+  await next();
+});
 
 // Resuelve la identidad en una sola capa. No crea visitantes: eso solo lo hacen el mar y el perfil.
 app.use("/api/*", async (c, next) => {
@@ -245,8 +314,22 @@ const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const LIMITE_INTENTOS = 10;
 const VENTANA_INTENTOS = 15 * 60 * 1000;
 const intentos = new Map<string, number[]>();
+const intentosGlobales: number[] = [];
 
-export const resetRateLimit = () => intentos.clear();
+export const resetRateLimit = () => {
+  intentos.clear();
+  intentosGlobales.length = 0;
+};
+
+const LIMITE_MAPA = 5_000;
+
+const acotarMapa = (mapa: Map<string, number[]>) => {
+  while (mapa.size > LIMITE_MAPA) {
+    const primera = mapa.keys().next().value;
+    if (primera === undefined) break;
+    mapa.delete(primera);
+  }
+};
 
 const dentroDelLimite = (email: string) => {
   const ahora = Date.now();
@@ -257,6 +340,17 @@ const dentroDelLimite = (email: string) => {
   }
   previos.push(ahora);
   intentos.set(email, previos);
+  acotarMapa(intentos);
+  return true;
+};
+
+const dentroDelLimiteGlobal = () => {
+  const ahora = Date.now();
+  while (intentosGlobales.length > 0 && ahora - intentosGlobales[0] > 60_000) {
+    intentosGlobales.shift();
+  }
+  if (intentosGlobales.length >= 100) return false;
+  intentosGlobales.push(ahora);
   return true;
 };
 
@@ -295,11 +389,13 @@ app.post("/api/auth/register", async (c) => {
     .limit(1);
   if (yaTieneCuenta) return c.json({ error: "ese visitante ya tiene cuenta" }, 409);
 
+  const passwordHash = await hashPassword(password);
+
   try {
     const { token } = await db.transaction(async (tx) => {
       const [cuenta] = await tx
         .insert(accounts)
-        .values({ email, passwordHash: await hashPassword(password), visitorId: visitor })
+        .values({ email, passwordHash, visitorId: visitor })
         .returning();
 
       const token = generarToken();
@@ -327,6 +423,10 @@ app.post("/api/auth/login", async (c) => {
   if (!email || typeof body.password !== "string") {
     return c.json({ error: "email y contraseña son obligatorios" }, 422);
   }
+  if (email.length > 254 || !EMAIL.test(email)) {
+    return c.json({ error: "email inválido" }, 422);
+  }
+  if (!dentroDelLimiteGlobal()) return c.json({ error: "demasiados intentos" }, 429);
   if (!dentroDelLimite(`login:${email}`)) return c.json({ error: "demasiados intentos" }, 429);
 
   const [cuenta] = await db.select().from(accounts).where(eq(accounts.email, email)).limit(1);
@@ -338,6 +438,8 @@ app.post("/api/auth/login", async (c) => {
   if (!(await verificarPassword(password, cuenta.passwordHash))) {
     return c.json({ error: "credenciales inválidas" }, 401);
   }
+
+  await db.delete(sessions).where(lt(sessions.expiresAt, sql`now()`));
 
   const token = await crearSesion(cuenta.id);
   repartirCookie(c, cuenta.visitorId);
@@ -399,7 +501,7 @@ app.put("/api/profile", async (c) => {
   }
 
   const alias = body.alias.trim();
-  if (tieneInvisibles(alias)) {
+  if (tieneControles(alias)) {
     return c.json({ error: "el alias contiene caracteres no permitidos" }, 422);
   }
 
@@ -449,7 +551,8 @@ app.put("/api/profile", async (c) => {
 // Postgres cuenta puntos de código y no admite \u0000: validamos igual que el CHECK de la tabla.
 // Se permiten solo los saltos de línea y tabuladores; nada de otros controles ni bidi/zero-width.
 const INVISIBLES = /[\p{Cc}\p{Cf}]/u;
-const tieneInvisibles = (texto: string) => INVISIBLES.test(texto.replace(/[\n\r\t]/g, ""));
+const tieneInvisibles = (texto: string) => INVISIBLES.test(texto.replace(/[\n\r\t\u200d]/g, ""));
+const tieneControles = (texto: string) => INVISIBLES.test(texto);
 
 // -------------------------------------------------------------------- mis botellas
 const estadoBotella = (
@@ -468,7 +571,8 @@ app.get("/api/bottles/mine", async (c) => {
   const raw = c.req.query("before");
   let before: number | undefined;
   if (raw !== undefined) {
-    if (!/^\d+$/.test(raw) || Number(raw) <= 0) {
+    const numero = Number(raw);
+    if (!/^\d+$/.test(raw) || numero <= 0 || numero > ID_MAX) {
       return c.json({ error: "before debe ser un id positivo" }, 422);
     }
     before = Number(raw);
@@ -641,7 +745,9 @@ app.post("/api/bottles/:id/discard", async (c) => {
     return c.json({ error: "no puedes interactuar con esa botella" }, 403);
   }
 
-  const salida = { estado: "ok" as "ok" | "fijada" | "ajena" | "no-existe" };
+  const salida = {
+    estado: "ok" as "ok" | "fijada" | "ajena" | "no-existe" | "bloqueada",
+  };
   let destruida: Bottle | undefined;
 
   await db.transaction(async (tx) => {
@@ -654,6 +760,18 @@ app.post("/api/bottles/:id/discard", async (c) => {
     if (!viva) {
       salida.estado = "no-existe";
       return;
+    }
+
+    if (visitor) {
+      const [bloqueo] = await tx
+        .select()
+        .from(blocks)
+        .where(bloqueoEntre(visitor, viva.authorVisitor))
+        .limit(1);
+      if (bloqueo) {
+        salida.estado = "bloqueada";
+        return;
+      }
     }
 
     const [reserva] = await tx
@@ -679,7 +797,12 @@ app.post("/api/bottles/:id/discard", async (c) => {
         .where(and(eq(bottles.id, id), isNull(bottles.destroyedAt)))
         .returning();
       destruida = d;
-      await tx.delete(reservations).where(eq(reservations.bottleId, id));
+      if (d) {
+        await barrerExpiradas(tx, [eq(reservations.bottleId, id)]);
+        await tx.delete(reservations).where(eq(reservations.bottleId, id));
+        // La botella se borra en blando: las notificaciones dejan de apuntar a ella.
+        await tx.update(notifications).set({ bottleId: null }).where(eq(notifications.bottleId, id));
+      }
     } else if (visitor) {
       // Devolver al mar también suelta mi reserva, sin tocar una conversación fija.
       await tx.delete(reservations).where(and(
@@ -691,6 +814,9 @@ app.post("/api/bottles/:id/discard", async (c) => {
   });
 
   if (salida.estado === "no-existe") return c.json({ error: "botella no encontrada" }, 404);
+  if (salida.estado === "bloqueada") {
+    return c.json({ error: "no puedes interactuar con esa botella" }, 403);
+  }
   if (salida.estado === "fijada") {
     return c.json({ error: "la botella ya es una conversación abierta" }, 409);
   }
@@ -740,22 +866,28 @@ app.post("/api/bottles/:id/pick", async (c) => {
         .for("update");
       if (!viva) return false;
 
-      // Las reservas expiradas no deben seguir ocupando la botella ni mi hueco.
-      await tx.delete(reservations).where(and(
-        eq(reservations.bottleId, id),
-        lte(reservations.expiresAt, sql`now()`),
-      ));
-      await tx.delete(reservations).where(and(
-        eq(reservations.visitorId, visitor),
-        lte(reservations.expiresAt, sql`now()`),
-      ));
+      const [bloqueo] = await tx
+        .select()
+        .from(blocks)
+        .where(bloqueoEntre(visitor, viva.authorVisitor))
+        .limit(1);
+      if (bloqueo) return "bloqueada";
+
+      // Las reservas expiradas no deben seguir ocupando la botella ni mi hueco, y avisan.
+      await barrerExpiradas(tx, [eq(reservations.bottleId, id)]);
+      await barrerExpiradas(tx, [eq(reservations.visitorId, visitor)]);
 
       await tx
         .insert(reservations)
         .values({ bottleId: id, visitorId: visitor, expiresAt: sql`now() + interval '48 hours'` });
+
+      await notificar(tx, viva.authorVisitor, "botella_recogida", id);
       return true;
     });
 
+    if (reservada === "bloqueada") {
+      return c.json({ error: "no puedes interactuar con esa botella" }, 403);
+    }
     if (!reservada) return c.json({ error: "botella no encontrada" }, 404);
   } catch (err) {
     if (codigoError(err) === "23505") {
@@ -803,6 +935,8 @@ app.post("/api/bottles/:id/release", async (c) => {
       salida.estado = "no-existe";
       return;
     }
+
+    // Liberar mi propia reserva sigue permitido aunque esté bloqueado: nadie queda atrapado.
 
     const [reserva] = await tx
       .select()
@@ -935,11 +1069,6 @@ app.post("/api/bottles/:id/messages", async (c) => {
         salida.estado = "solo-lectora";
         return;
       }
-      if (reserva.expiresAt.getTime() <= Date.now()) {
-        salida.estado = "expirada";
-        return;
-      }
-
       const [confirmada] = await tx
         .update(reservations)
         .set({ confirmedAt: sql`now()`, expiresAt: sql`'infinity'` })
@@ -970,6 +1099,11 @@ app.post("/api/bottles/:id/messages", async (c) => {
       .values({ bottleId: id, senderVisitor: visitor, senderAlias: perfil.alias, text })
       .returning();
     creado = msg;
+
+    const destinatario = esAutora ? reserva?.visitorId : bottle.authorVisitor;
+    if (destinatario && destinatario !== visitor) {
+      await notificar(tx, destinatario, "mensaje_nuevo", id);
+    }
   });
 
   if (salida.estado === "no-existe") return c.json({ error: "botella no encontrada" }, 404);
@@ -1022,7 +1156,8 @@ app.get("/api/bottles/:id/messages", async (c) => {
   const raw = c.req.query("before");
   let before: number | undefined;
   if (raw !== undefined) {
-    if (!/^\d+$/.test(raw) || Number(raw) <= 0) {
+    const numero = Number(raw);
+    if (!/^\d+$/.test(raw) || numero <= 0 || numero > ID_MAX) {
       return c.json({ error: "before debe ser un id positivo" }, 422);
     }
     before = Number(raw);
@@ -1073,10 +1208,7 @@ const puedeSubir = (visitor: string) => {
   return true;
 };
 
-app.post(
-  "/api/profile/photos",
-  bodyLimit({ maxSize: 6 * 1024 * 1024 }),
-  async (c) => {
+app.post("/api/profile/photos", async (c) => {
     const visitor = c.get("visitor");
     if (!visitor) return c.json({ error: "inicia sesión" }, 401);
     if (!(await perfilDe(visitor))) return c.json({ error: "necesitas un alias" }, 403);
@@ -1132,8 +1264,7 @@ app.post(
       await Deno.remove(temporal).catch(() => {});
       throw err;
     }
-  },
-);
+});
 
 app.delete("/api/profile/photos/:id", async (c) => {
   const visitor = c.get("visitor");
@@ -1229,16 +1360,26 @@ app.post("/api/blocks", async (c) => {
       .onConflictDoNothing();
 
     // Una reserva sin confirmar entre los dos no puede quedar secuestrada: vuelve al mar.
-    await tx.execute(sql`
-      delete from reservations r
-      using bottles b
-      where r.bottle_id = b.id
-        and r.confirmed_at is null
-        and (
-          (r.visitor_id = ${visitor} and b.author_visitor = ${objetivo.visitorId})
-          or (r.visitor_id = ${objetivo.visitorId} and b.author_visitor = ${visitor})
-        )
-    `);
+    const entreLaPareja = await tx
+      .select({ bottleId: reservations.bottleId, visitorId: reservations.visitorId, expiresAt: reservations.expiresAt })
+      .from(reservations)
+      .innerJoin(bottles, eq(bottles.id, reservations.bottleId))
+      .where(and(
+        isNull(reservations.confirmedAt),
+        or(
+          and(eq(reservations.visitorId, visitor), eq(bottles.authorVisitor, objetivo.visitorId)),
+          and(eq(reservations.visitorId, objetivo.visitorId), eq(bottles.authorVisitor, visitor)),
+        ),
+      ));
+
+    for (const reserva of entreLaPareja) {
+      await tx
+        .delete(reservations)
+        .where(and(eq(reservations.bottleId, reserva.bottleId), isNull(reservations.confirmedAt)));
+      if (reserva.expiresAt.getTime() <= Date.now()) {
+        await notificar(tx, reserva.visitorId, "reserva_caducada", reserva.bottleId);
+      }
+    }
   });
 
   return c.json({ data: { publicId, alias: objetivo.alias } }, 201);
@@ -1317,7 +1458,10 @@ app.post("/api/reports", async (c) => {
 
   let bottleId: number | null = null;
   if (body.bottleId !== undefined && body.bottleId !== null) {
-    if (typeof body.bottleId !== "number" || !Number.isSafeInteger(body.bottleId) || body.bottleId <= 0) {
+    if (
+      typeof body.bottleId !== "number" || !Number.isSafeInteger(body.bottleId) ||
+      body.bottleId <= 0 || body.bottleId > ID_MAX
+    ) {
       return c.json({ error: "bottleId inválido" }, 422);
     }
     const [botella] = await db
@@ -1337,6 +1481,77 @@ app.post("/api/reports", async (c) => {
     .returning();
 
   return c.json({ data: { id: creado.id } }, 201);
+});
+
+// -------------------------------------------------------------- notificaciones
+const publicaNotificacion = (n: {
+  id: number;
+  type: string;
+  bottleId: number | null;
+  readAt: Date | null;
+  createdAt: Date;
+}) => ({
+  id: n.id,
+  type: n.type,
+  bottleId: n.bottleId,
+  read: n.readAt !== null,
+  createdAt: n.createdAt,
+});
+
+app.get("/api/notifications", async (c) => {
+  const visitor = c.get("visitor");
+  if (!visitor) return c.json({ error: "inicia sesión" }, 401);
+
+  // Red de seguridad: reservas expiradas mías que nadie haya barrido todavía.
+  await db.transaction(async (tx) => {
+    await barrerExpiradas(tx, [eq(reservations.visitorId, visitor)]);
+  });
+
+  const filas = await db
+    .select()
+    .from(notifications)
+    .where(eq(notifications.visitorId, visitor))
+    .orderBy(desc(notifications.id))
+    .limit(50);
+
+  const [pendientes] = await db
+    .select({ cuantas: count() })
+    .from(notifications)
+    .where(and(eq(notifications.visitorId, visitor), isNull(notifications.readAt)));
+
+  return c.json({
+    data: filas.map(publicaNotificacion),
+    unread: Number(pendientes.cuantas),
+  });
+});
+
+app.post("/api/notifications/read-all", async (c) => {
+  const visitor = c.get("visitor");
+  if (!visitor) return c.json({ error: "inicia sesión" }, 401);
+
+  await db
+    .update(notifications)
+    .set({ readAt: sql`now()` })
+    .where(and(eq(notifications.visitorId, visitor), isNull(notifications.readAt)));
+
+  return c.body(null, 204);
+});
+
+app.post("/api/notifications/:id/read", async (c) => {
+  const visitor = c.get("visitor");
+  if (!visitor) return c.json({ error: "inicia sesión" }, 401);
+
+  const id = idValido(c.req.param("id"));
+  if (id === null) return c.json({ error: "notificación no encontrada" }, 404);
+
+  const [actualizada] = await db
+    .update(notifications)
+    .set({ readAt: sql`now()` })
+    .where(and(eq(notifications.id, id), eq(notifications.visitorId, visitor)))
+    .returning();
+  if (!actualizada) return c.json({ error: "notificación no encontrada" }, 404);
+
+  return c.body(null, 204);
 });
 
 // ------------------------------------------------------------------- errores

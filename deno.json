@@ -12,7 +12,7 @@
   "tasks": {
     "dev": "deno run --watch -A main.ts",
     "start": "deno run -A main.ts",
-    "check": "deno check main.ts drizzle.config.ts",
+    "check": "deno check main.ts api_test.ts drizzle.config.ts",
     "db:push": "deno run -A npm:drizzle-kit@0.31.11 push",
     "db:generate": "deno run -A npm:drizzle-kit@0.31.11 generate",
     "db:studio": "deno run -A npm:drizzle-kit@0.31.11 studio",
